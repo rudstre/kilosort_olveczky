@@ -1,73 +1,93 @@
-from pathlib import PosixPath
-
-import tkinter as tk
-from tkinter import filedialog
-
-import numpy as np
 import pandas as pd
-
+import numpy as np
+from pathlib import Path
+import seaborn as sns
 import matplotlib.pyplot as plt
-from matplotlib import gridspec, rcParams
+from kilosort.io import load_ops
+from kilosort.data_tools import (
+    mean_waveform, cluster_templates, get_good_cluster, get_labels, get_cluster_spikes,
+    get_spike_waveforms, get_best_channel
+)
 
-# outputs saved to results_dir
+# Set Seaborn theme and color palette
+sns.set_theme(style="whitegrid")
 
-root = tk.Tk()
-root.withdraw()  # Hide the root window
+# File paths
+results_dir = Path("C:/Users/Rudy/Documents/recordings/kilosort_out")
+cluster_info_path = results_dir / "cluster_info.tsv"
+new_cluster_id = 23  # The new Phy-assigned `cluster_id` you want to plot
 
-results_dir = filedialog.askdirectory()
+# Load the cluster mapping with pandas, which handles headers and data types
+cluster_info = pd.read_csv(cluster_info_path, sep='\t')
 
-if results_dir:
-    print("Selected folder:", results_dir)
-    results_dir = PosixPath(results_dir)  # Explicitly use PosixPath
+# Assume that the first column is the original Kilosort ID and the second is the new Phy ID
+# Adjust this if the columns are reversed or named differently
+cluster_map = dict(zip(cluster_info.cluster_id.iloc[:, 1], cluster_info.cluster_id.iloc[:, 0]))
 
-# ops = load_ops(results_dir / 'ops.npy')
-camps = pd.read_csv(results_dir / 'cluster_Amplitude.tsv', sep='\t')['Amplitude'].values
-contam_pct = pd.read_csv(results_dir / 'cluster_ContamPct.tsv', sep='\t')['ContamPct'].values
-chan_map = np.load(results_dir / 'channel_map.npy')
-templates = np.load(results_dir / 'templates.npy')
-chan_best = (templates ** 2).sum(axis=1).argmax(axis=-1)
-chan_best = chan_map[chan_best]
-amplitudes = np.load(results_dir / 'amplitudes.npy')
-st = np.load(results_dir / 'spike_times.npy')
-clu = np.load(results_dir / 'spike_clusters.npy')
-firing_rates = np.unique(clu, return_counts=True)[1] * 30000 / st.max()
-# dshift = ops['dshift']
+# Get the original Kilosort ID for the specified new Phy cluster ID
+original_cluster_id = cluster_map.get(new_cluster_id)
 
-rcParams['axes.spines.top'] = False
-rcParams['axes.spines.right'] = False
-gray = .5 * np.ones(3)
+# Load spike clusters and select spikes for the specified (original) cluster ID
+spike_clusters = np.load(results_dir / "spike_clusters.npy")
+spikes = np.array([s for s, c in zip(get_cluster_spikes(original_cluster_id, results_dir), spike_clusters) if c == original_cluster_id])
+waves = get_spike_waveforms(spikes, results_dir, chan=get_best_channel(original_cluster_id, results_dir))
 
-fig = plt.figure(figsize=(10, 10), dpi=100)
-grid = gridspec.GridSpec(3, 3, figure=fig, hspace=0.5, wspace=0.5)
+# Parameters
+every = 500
+num_spikes = waves.shape[1]
+num_samples = waves.shape[0]
+n_groups = num_spikes // every  # Calculate the number of groups based on total spikes
 
-ax = fig.add_subplot(grid[1, 0])
-nb = ax.hist(firing_rates, 20, color=gray)
-ax.set_xlabel('firing rate (Hz)')
-ax.set_ylabel('# of units')
+# Average spike waveforms
+averaged_spikes = waves[:, :n_groups * every].reshape(num_samples, n_groups, every).mean(axis=2)
+n_averaged_spikes = n_groups  # Set this based on the actual number of groups
 
-ax = fig.add_subplot(grid[1, 1])
-nb = ax.hist(camps, 20, color=gray)
-ax.set_xlabel('amplitude')
-ax.set_ylabel('# of units')
+# Set up the color palette
+palette = sns.color_palette("viridis", n_colors=n_averaged_spikes)
 
-ax = fig.add_subplot(grid[1, 2])
-nb = ax.hist(np.minimum(100, contam_pct), np.arange(0, 105, 5), color=gray)
-ax.plot([10, 10], [0, nb[0].max()], 'k--')
-ax.set_xlabel('% contamination')
-ax.set_ylabel('# of units')
-ax.set_title('< 10% = good units')
+# Load total samples from spike_times.npy for recording duration
+spike_times = np.load(results_dir / 'spike_times.npy')  # Load spike times in samples
+total_samples = spike_times.max()  # Max sample as recording end
+total_time_minutes = total_samples / 1.8e6  # Convert to minutes (assuming 30kHz)
 
-for k in range(2):
-    ax = fig.add_subplot(grid[2, k])
-    is_ref = contam_pct < 10.
-    ax.scatter(firing_rates[~is_ref], camps[~is_ref], s=3, color='r', label='mua', alpha=0.25)
-    ax.scatter(firing_rates[is_ref], camps[is_ref], s=3, color='b', label='good', alpha=0.25)
-    ax.set_ylabel('amplitude (a.u.)')
-    ax.set_xlabel('firing rate (Hz)')
-    ax.legend()
-    if k == 1:
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_title('loglog')
+# Create a two-row plot layout
+fig, axs = plt.subplots(2, 1, figsize=(10, 10), dpi=350, gridspec_kw={'height_ratios': [1, 0.5]})
 
+# Plot 1: Averaged Spike Waveform Drift Over Time
+time = np.arange(averaged_spikes.shape[0])
+for i in range(n_averaged_spikes):
+    sns.lineplot(x=time, y=averaged_spikes[:, i], ax=axs[0], color=palette[i], linewidth=2.5)
+
+# Add color bar to the averaged waveform plot
+sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=0, vmax=n_averaged_spikes))
+sm.set_array([])
+cbar = fig.colorbar(sm, ax=axs[0], ticks=[0, n_averaged_spikes])
+cbar.ax.set_yticklabels(['Early', 'Late'])
+cbar.set_label('Spike Order')
+
+# Add labels and title for the averaged waveform plot
+axs[0].set_xlabel('Time')
+axs[0].set_ylabel('Amplitude')
+axs[0].set_title('Averaged Spike Waveform Drift Over Time')
+
+# Plot 2: Raster Plot of Spike Occurrences
+# Convert spike times to minutes based on 30kHz sampling rate
+spike_times_min = spikes / 1.8e6  # Convert samples to minutes
+spike_groups = np.arange(len(spikes)) // every  # Assign each spike to a group based on index
+
+# Plot each spike at its actual timestamp with the color of its group
+for group_idx in range(n_averaged_spikes):
+    # Select spikes that belong to the current group
+    group_spikes = spike_times_min[spike_groups == group_idx]
+    axs[1].scatter(group_spikes, np.zeros_like(group_spikes), color=palette[group_idx], s=10, label=f'Group {group_idx+1}')
+
+# Formatting the raster plot
+axs[1].set_ylim(-0.1, 0.1)
+axs[1].set_xlim(0, total_time_minutes)  # Set x-axis to cover the full recording duration
+axs[1].set_xlabel('Time (minutes)')
+axs[1].set_yticks([])
+axs[1].set_ylabel('Spike')
+axs[1].set_title('Spike Occurrences Over Time by Group')
+
+plt.tight_layout()
 plt.show()
