@@ -31,7 +31,6 @@ def build_regex_from_format(datetime_format):
         "%H": r"\d{2}",
         "%M": r"\d{2}",
         "%S": r"\d{2}",
-        "_": r"_",
     }
     regex_pattern = re.escape(datetime_format)
     for directive, regex in format_to_regex.items():
@@ -53,15 +52,15 @@ def prompt_user_for_datetime_format(example_name, context):
     print(
         f"""
 Please provide the datetime format for the {context}.
-Example {context}: {example_name}
 
 Use Python datetime format codes:
 - %Y: Year (4 digits), %y: Year (2 digits)
 - %m: Month (2 digits), %d: Day (2 digits)
 - %H: Hour (24-hour clock), %M: Minute, %S: Second
-- _: Literal underscore
 
 For example, if the {context} contains '240830_145124', enter: '%y%m%d_%H%M%S'.
+
+Example {context}: {example_name}
 """
     )
     while True:
@@ -159,7 +158,7 @@ def main(input_folder, output_folder, n_jobs):
         sorted_files = sort_files_by_datetime(rhd_files, file_datetime_format)
 
         for recording_path in tqdm(sorted_files, desc=f"Processing recordings from {human_readable_datetime}"):
-            recording = se.read_intan(recording_path, stream_id="0")
+            recording = se.read_intan(recording_path, stream_id="0",ignore_integrity_checks=True)
             recordings.append(recording)
 
             # Extract datetime from the file name
@@ -187,9 +186,9 @@ def main(input_folder, output_folder, n_jobs):
         exit()
 
     # Validate output folder and save concatenated recording
-    # validate_output_folder(output_folder)
+    validate_output_folder(output_folder)
     logging.info("Saving concatenated recording...")
-    # concatenated_recording.save(folder=output_folder, n_jobs=n_jobs)
+    concatenated_recording.save(dtype="int16", format="binary", folder=output_folder, n_jobs=n_jobs)
 
     # Save metadata
     save_metadata(metadata, output_folder)
