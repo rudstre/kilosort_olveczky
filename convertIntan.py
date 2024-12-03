@@ -150,12 +150,22 @@ def main(input_folder, output_folder, n_jobs, recursive):
         args = [(file, file_datetime_formats) for file in rhd_files]
 
         # Start multiprocessing pool
+        results = []
         with Pool(n_jobs) as pool:
-            # Use imap_unordered for asynchronous processing
-            results = []
-            for result in pool.imap_unordered(process_rhd_file, args, chunksize=1):
+            # Define callback for progress updates
+            def update_progress(result):
                 results.append(result)
                 progress_bar.update(1)
+
+            # Use map_async for non-blocking processing
+            async_results = [
+                pool.apply_async(process_rhd_file, (arg,), callback=update_progress)
+                for arg in args
+            ]
+
+            # Wait for all tasks to complete
+            for async_result in async_results:
+                async_result.wait()
 
     # Combine and sort results by datetime
     all_recordings, all_metadata = [], []
