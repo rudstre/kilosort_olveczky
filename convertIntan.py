@@ -18,13 +18,26 @@ import time
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Initialize previous counters
+prev_read_bytes = 0
+prev_write_bytes = 0
 def log_system_status():
-    """Log CPU, memory, and disk I/O stats."""
+    global prev_read_bytes, prev_write_bytes
+    process = psutil.Process(os.getpid())
     memory = psutil.virtual_memory()
-    io_counters = psutil.disk_io_counters()
+    io_counters = process.io_counters()
+
+    # Calculate incremental I/O
+    read_bytes = io_counters.read_bytes - prev_read_bytes
+    write_bytes = io_counters.write_bytes - prev_write_bytes
+
+    # Update previous counters
+    prev_read_bytes = io_counters.read_bytes
+    prev_write_bytes = io_counters.write_bytes
+
     logging.info(f"Memory Usage: {memory.percent}%")
-    logging.info(f"Disk Read: {io_counters.read_bytes / (1024**2):.2f} MB, "
-                 f"Disk Write: {io_counters.write_bytes / (1024**2):.2f} MB")
+    logging.info(f"Process Disk Read since last check: {read_bytes / (1024**2):.2f} MB, "
+                 f"Process Disk Write since last check: {write_bytes / (1024**2):.2f} MB")
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
