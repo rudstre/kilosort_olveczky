@@ -153,7 +153,8 @@ def process_rhd_file_batch(args_batch):
     batch_results = []
     for args in args_batch:
         result = process_rhd_file(args)
-        log_system_status()
+        if len(batch_results) % 10 == 0:  # Log system status every 10 files
+            log_system_status()
         if result:
             batch_results.append(result)
     return batch_results
@@ -171,7 +172,7 @@ def main(input_folder, output_folder, n_jobs, recursive):
     validate_output_folder(output_folder)
 
     # Group files into smaller batches
-    batch_size = 10
+    batch_size = 50
     file_batches = list(chunked_iterable(rhd_files, batch_size))
 
     # Initialize progress bar
