@@ -129,7 +129,9 @@ def process_rhd_file(args):
     """Process a single .rhd file."""
     file_path, file_datetime_formats = args
     try:
+        logging.info(f"Before reading recording: {get_process_memory_usage():.2f} MB")
         recording = se.read_intan(file_path, stream_id="0", ignore_integrity_checks=True)
+        logging.info(f"After reading recording: {get_process_memory_usage():.2f} MB")
 
         # Extract datetime from the file name
         file_datetime = None
@@ -153,6 +155,7 @@ def process_rhd_file(args):
 
         # Prepare metadata
         num_samples = recording.get_num_frames()
+        logging.info(f"After getting num_frames: {get_process_memory_usage():.2f} MB")
         metadata = {
             "file_name": os.path.basename(file_path),
             "start_sample": 0,
