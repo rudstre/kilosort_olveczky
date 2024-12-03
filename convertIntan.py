@@ -196,6 +196,8 @@ def main(input_folder, output_folder, n_jobs, recursive):
                 except Exception as e:
                     logging.error(f"Error processing file: {e}")
                 progress_bar.update(1)
+                log_system_status()
+
 
     # Combine and sort results by datetime
     all_recordings, all_metadata = [], []
