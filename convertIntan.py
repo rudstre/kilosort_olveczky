@@ -153,13 +153,14 @@ def main(input_folder, output_folder, n_jobs, recursive):
         # Use ProcessPoolExecutor for parallel processing
         results = []
         max_tasks_in_flight = n_jobs + 2  # Allow a small buffer of tasks beyond the number of workers
-        futures = []
+        futures = []  # Initialize as a list to store Future objects
 
         with ProcessPoolExecutor(max_workers=n_jobs) as executor:
             for arg in args:
                 if len(futures) >= max_tasks_in_flight:
                     # Wait for at least one task to complete before submitting more
-                    done, futures = wait(futures, return_when="FIRST_COMPLETED")
+                    done, not_done = wait(futures, return_when="FIRST_COMPLETED")
+                    futures = list(not_done)  # Keep only unfinished tasks
                     for future in done:
                         try:
                             results.append(future.result())
