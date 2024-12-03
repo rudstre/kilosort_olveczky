@@ -153,7 +153,7 @@ def main(input_folder, output_folder, n_jobs, recursive):
         with Pool(n_jobs) as pool:
             # Use imap_unordered for asynchronous processing
             results = []
-            for result in pool.imap_unordered(process_rhd_file, args):
+            for result in pool.imap_unordered(process_rhd_file, args, chunksize=1):
                 results.append(result)
                 progress_bar.update(1)
 
