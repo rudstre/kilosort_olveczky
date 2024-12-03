@@ -18,13 +18,22 @@ import time
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+def get_process_memory_usage():
+    """Get memory usage of the current process and its children."""
+    process = psutil.Process(os.getpid())
+    mem_usage = process.memory_info().rss / (1024**2)  # Convert to MB
+    for child in process.children(recursive=True):
+        mem_usage += child.memory_info().rss / (1024**2)
+    return mem_usage
+
+
 # Initialize previous counters
 prev_read_bytes = 0
 prev_write_bytes = 0
 def log_system_status():
     global prev_read_bytes, prev_write_bytes
     process = psutil.Process(os.getpid())
-    memory = psutil.virtual_memory()
+    memory = get_process_memory_usage()
     io_counters = process.io_counters()
 
     # Calculate incremental I/O
