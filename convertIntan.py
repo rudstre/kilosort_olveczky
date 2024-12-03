@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import re
 import json
@@ -6,18 +7,15 @@ import logging
 import argparse
 from glob import glob
 from datetime import datetime
+from itertools import islice
 from tqdm import tqdm
-import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import spikeinterface as si
 import spikeinterface.extractors as se
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# Set multiprocessing start method dynamically
-multiprocessing.set_start_method('spawn' if os.name == 'nt' else 'fork', force=True)
 
 
 def build_regex_from_format(datetime_format):
@@ -135,6 +133,23 @@ def process_rhd_file(args):
         return None, None
 
 
+def chunked_iterable(iterable, size):
+    """Yield successive n-sized chunks from an iterable."""
+    it = iter(iterable)
+    while chunk := list(islice(it, size)):
+        yield chunk
+
+
+def process_rhd_file_batch(args_batch):
+    """Process a batch of .rhd files."""
+    batch_results = []
+    for args in args_batch:
+        result = process_rhd_file(args)
+        if result:
+            batch_results.append(result)
+    return batch_results
+
+
 def main(input_folder, output_folder, n_jobs, recursive):
     # Load all .rhd files
     rhd_files = load_rhd_files(input_folder, recursive)
@@ -146,38 +161,27 @@ def main(input_folder, output_folder, n_jobs, recursive):
     # Validate output folder
     validate_output_folder(output_folder)
 
+    # Group files into smaller batches
+    batch_size = 10
+    file_batches = list(chunked_iterable(rhd_files, batch_size))
+
     # Initialize progress bar
     with tqdm(total=len(rhd_files), desc="Processing Files", position=0, leave=True) as progress_bar:
-        args = [(file, file_datetime_formats) for file in rhd_files]
+        args_batches = [
+            [(file, file_datetime_formats) for file in batch] for batch in file_batches
+        ]
 
-        # Use ProcessPoolExecutor for parallel processing
         results = []
-        max_tasks_in_flight = n_jobs + 2  # Allow a small buffer of tasks beyond the number of workers
-        futures = []  # Initialize as a list to store Future objects
-
         with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-            for arg in args:
-                if len(futures) >= max_tasks_in_flight:
-                    # Wait for at least one task to complete before submitting more
-                    done, not_done = wait(futures, return_when="FIRST_COMPLETED")
-                    futures = list(not_done)  # Keep only unfinished tasks
-                    for future in done:
-                        try:
-                            results.append(future.result())
-                        except Exception as e:
-                            logging.error(f"Error processing file: {e}")
-                        progress_bar.update(1)
+            futures = [executor.submit(process_rhd_file_batch, args_batch) for args_batch in args_batches]
 
-                # Submit a new task
-                futures.append(executor.submit(process_rhd_file, arg))
-
-            # Handle remaining tasks
             for future in as_completed(futures):
                 try:
-                    results.append(future.result())
+                    batch_results = future.result()
+                    results.extend(batch_results)
                 except Exception as e:
-                    logging.error(f"Error processing file: {e}")
-                progress_bar.update(1)
+                    logging.error(f"Error processing batch: {e}")
+                progress_bar.update(len(args_batches[0]))  # Update for batch size
 
     # Combine and sort results by datetime
     all_recordings, all_metadata = [], []
@@ -223,4 +227,3 @@ if __name__ == "__main__":
     args.output = args.output or input("Enter the path for the output folder: ").strip()
     args.recursive = args.recursive or input("Search for recordings in subfolders? (yes/no): ").strip().lower() in ("yes", "y")
     main(args.input, args.output, args.jobs, args.recursive)
-    multiprocessing.active_children()
