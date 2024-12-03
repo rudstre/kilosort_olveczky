@@ -44,7 +44,7 @@ def log_system_status():
     prev_read_bytes = io_counters.read_bytes
     prev_write_bytes = io_counters.write_bytes
 
-    logging.info(f"Memory Usage: {memory.percent}%")
+    logging.info(f"Memory Usage: {memory}%")
     logging.info(f"Process Disk Read since last check: {read_bytes / (1024**2):.2f} MB, "
                  f"Process Disk Write since last check: {write_bytes / (1024**2):.2f} MB")
 
