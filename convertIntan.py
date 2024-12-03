@@ -1,51 +1,12 @@
-import logging
 import os
 import gc
 import re
-import argparse
 from queue import Queue
 from multiprocessing import Process, Queue as MPQueue, cpu_count
 from datetime import datetime
-
-import psutil
+from tqdm import tqdm
 import spikeinterface as si
 import spikeinterface.extractors as se
-
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# Initialize previous counters
-prev_read_bytes = 0
-prev_write_bytes = 0
-
-
-def get_process_memory_usage():
-    """Get memory usage of the current process and its children."""
-    process = psutil.Process(os.getpid())
-    mem_usage = process.memory_info().rss / (1024**2)  # Convert to MB
-    for child in process.children(recursive=True):
-        mem_usage += child.memory_info().rss / (1024**2)
-    return mem_usage
-
-
-def log_system_status():
-    global prev_read_bytes, prev_write_bytes
-    process = psutil.Process(os.getpid())
-    memory = get_process_memory_usage()
-    io_counters = process.io_counters()
-
-    # Calculate incremental I/O
-    read_bytes = io_counters.read_bytes - prev_read_bytes
-    write_bytes = io_counters.write_bytes - prev_write_bytes
-
-    # Update previous counters
-    prev_read_bytes = io_counters.read_bytes
-    prev_write_bytes = io_counters.write_bytes
-
-    logging.info(f"Memory Usage: {memory / 1000:.2f}GB")
-    logging.info(f"Process Disk Read since last check: {read_bytes / (1024**2):.2f} MB, "
-                 f"Process Disk Write since last check: {write_bytes / (1024**2):.2f} MB")
-
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -64,7 +25,6 @@ def build_regex_from_format(datetime_format):
             i += 1
     return regex_pattern
 
-
 def extract_datetime(name, datetime_format):
     """Extract a datetime substring from a name using the provided format."""
     regex_pattern = build_regex_from_format(datetime_format)
@@ -72,7 +32,6 @@ def extract_datetime(name, datetime_format):
     if not match:
         raise ValueError(f"No datetime matching format '{datetime_format}' found in '{name}'.")
     return datetime.strptime(match.group(), datetime_format)
-
 
 def prompt_user_for_datetime_format(example_name):
     """Prompt the user to enter the datetime format based on an example name."""
@@ -90,15 +49,14 @@ def prompt_user_for_datetime_format(example_name):
             pass
         print(f"Invalid format '{datetime_format}'. Try again.")
 
-
-def producer_task(file_queue, batches):
+def producer_task(file_queue, batches, total_batches, progress_queue):
     """Producer task to enqueue batches of files."""
-    for batch in batches:
+    for i, batch in enumerate(batches):
         file_queue.put(batch)
+        progress_queue.put((i + 1, total_batches))  # Update progress
     file_queue.put(None)  # Signal end of tasks
 
-
-def worker_task(file_queue, result_queue):
+def worker_task(file_queue, result_queue, progress_queue):
     """Worker task to process batches."""
     while True:
         batch = file_queue.get()
@@ -118,14 +76,15 @@ def worker_task(file_queue, result_queue):
         finally:
             del recordings  # Free memory
             gc.collect()
+            progress_queue.put(1)  # Update progress for batch completion
 
-
-def final_stage_task(result_queue, final_result_path, num_batches):
+def final_stage_task(result_queue, final_result_path, num_batches, progress_queue):
     """Final stage to concatenate intermediate results."""
     intermediate_results = []
     for _ in range(num_batches):
         result = result_queue.get()
         intermediate_results.append(result)
+        progress_queue.put(1)  # Update progress for final stage
     try:
         final_recording = si.concatenate_recordings(intermediate_results)
         final_recording.save(folder=final_result_path, dtype="int16", format="binary")
@@ -136,6 +95,21 @@ def final_stage_task(result_queue, final_result_path, num_batches):
         del intermediate_results  # Free memory
         gc.collect()
 
+def progress_bar_task(progress_queue, total_tasks, desc):
+    """Task to update a progress bar."""
+    with tqdm(total=total_tasks, desc=desc, position=0) as pbar:
+        completed = 0
+        while completed < total_tasks:
+            update = progress_queue.get()
+            if isinstance(update, tuple):
+                # Producer updates with current batch number and total batches
+                completed = update[0]
+                pbar.n = completed
+                pbar.total = update[1]
+            else:
+                # Worker updates with completed task increments
+                completed += update
+            pbar.update(0)
 
 def main(input_folder, output_folder, batch_size, num_workers):
     # Find all RHD files
@@ -163,25 +137,32 @@ def main(input_folder, output_folder, batch_size, num_workers):
 
     # Split files into batches
     batches = [rhd_files[i:i + batch_size] for i in range(0, len(rhd_files), batch_size)]
+    total_batches = len(batches)
 
     # Queues for inter-process communication
     file_queue = MPQueue()
     result_queue = MPQueue()
+    progress_queue = MPQueue()
+
+    # Start progress bar process
+    total_tasks = total_batches + (total_batches - 1)  # Batches + final concatenation steps
+    progress_bar = Process(target=progress_bar_task, args=(progress_queue, total_tasks, "Processing Files"))
+    progress_bar.start()
 
     # Start producer process
-    producer = Process(target=producer_task, args=(file_queue, batches))
+    producer = Process(target=producer_task, args=(file_queue, batches, total_batches, progress_queue))
     producer.start()
 
     # Start worker processes
     workers = [
-        Process(target=worker_task, args=(file_queue, result_queue))
+        Process(target=worker_task, args=(file_queue, result_queue, progress_queue))
         for _ in range(num_workers)
     ]
     for worker in workers:
         worker.start()
 
     # Start final stage process
-    final_stage = Process(target=final_stage_task, args=(result_queue, output_folder, len(batches)))
+    final_stage = Process(target=final_stage_task, args=(result_queue, output_folder, total_batches, progress_queue))
     final_stage.start()
 
     # Wait for all processes to finish
@@ -189,12 +170,14 @@ def main(input_folder, output_folder, batch_size, num_workers):
     for worker in workers:
         worker.join()
     final_stage.join()
+    progress_bar.join()
 
     print("All tasks completed successfully!")
 
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Flexible and scalable RHD file concatenation pipeline with datetime sorting.")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Flexible and scalable RHD file concatenation pipeline with datetime sorting and progress bar.")
     parser.add_argument("-i", "--input", required=True, help="Input folder containing RHD files.")
     parser.add_argument("-o", "--output", required=True, help="Output folder for the concatenated recording.")
     parser.add_argument("-b", "--batch_size", type=int, default=20, help="Batch size for processing files.")
