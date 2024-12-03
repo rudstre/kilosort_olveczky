@@ -6,6 +6,8 @@ import logging
 import argparse
 from glob import glob
 from datetime import datetime
+
+import psutil
 from tqdm import tqdm
 import multiprocessing
 import spikeinterface as si
@@ -19,6 +21,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Set multiprocessing start method dynamically
 multiprocessing.set_start_method('spawn' if os.name == 'nt' else 'fork', force=True)
 
+def get_process_memory_usage():
+    """Get memory usage of the current process and its children."""
+    process = psutil.Process(os.getpid())
+    mem_usage = process.memory_info().rss / (1024**2)  # Convert to MB
+    for child in process.children(recursive=True):
+        mem_usage += child.memory_info().rss / (1024**2)
+    return mem_usage
+
+
+# Initialize previous counters
+prev_read_bytes = 0
+prev_write_bytes = 0
+def log_system_status():
+    global prev_read_bytes, prev_write_bytes
+    process = psutil.Process(os.getpid())
+    memory = get_process_memory_usage()
+    io_counters = process.io_counters()
+
+    # Calculate incremental I/O
+    read_bytes = io_counters.read_bytes - prev_read_bytes
+    write_bytes = io_counters.write_bytes - prev_write_bytes
+
+    # Update previous counters
+    prev_read_bytes = io_counters.read_bytes
+    prev_write_bytes = io_counters.write_bytes
+
+    logging.info(f"Memory Usage: {memory / 1000:.2f}GB")
+    logging.info(f"Process Disk Read since last check: {read_bytes / (1024**2):.2f} MB, "
+                 f"Process Disk Write since last check: {write_bytes / (1024**2):.2f} MB")
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -128,6 +159,7 @@ def process_rhd_file(args):
             "end_sample": num_samples - 1,
             "datetime": file_datetime.isoformat(),
         }
+        log_system_status()
         return recording, metadata
 
     except Exception as e:
