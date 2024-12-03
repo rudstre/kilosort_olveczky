@@ -10,7 +10,7 @@ from tqdm import tqdm
 import multiprocessing
 import spikeinterface as si
 import spikeinterface.extractors as se
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 
 
 # Set up logging
@@ -152,15 +152,28 @@ def main(input_folder, output_folder, n_jobs, recursive):
 
         # Use ProcessPoolExecutor for parallel processing
         results = []
-        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-            # Submit tasks to the executor
-            future_to_file = {executor.submit(process_rhd_file, arg): arg for arg in args}
+        max_tasks_in_flight = n_jobs + 2  # Allow a small buffer of tasks beyond the number of workers
+        futures = []
 
-            # Process completed futures as they finish
-            for future in as_completed(future_to_file):
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            for arg in args:
+                if len(futures) >= max_tasks_in_flight:
+                    # Wait for at least one task to complete before submitting more
+                    done, futures = wait(futures, return_when="FIRST_COMPLETED")
+                    for future in done:
+                        try:
+                            results.append(future.result())
+                        except Exception as e:
+                            logging.error(f"Error processing file: {e}")
+                        progress_bar.update(1)
+
+                # Submit a new task
+                futures.append(executor.submit(process_rhd_file, arg))
+
+            # Handle remaining tasks
+            for future in as_completed(futures):
                 try:
-                    result = future.result()
-                    results.append(result)
+                    results.append(future.result())
                 except Exception as e:
                     logging.error(f"Error processing file: {e}")
                 progress_bar.update(1)
