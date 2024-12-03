@@ -130,7 +130,7 @@ def process_rhd_file(args):
     file_path, file_datetime_formats = args
     try:
         logging.info(f"Before reading recording: {get_process_memory_usage():.2f} MB")
-        recording = se.read_intan(file_path, stream_id="0", ignore_integrity_checks=True)
+        recording = se.read_intan(file_path, stream_id="0")
         logging.info(f"After reading recording: {get_process_memory_usage():.2f} MB")
 
         # Extract datetime from the file name
