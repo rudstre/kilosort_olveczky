@@ -12,11 +12,19 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import spikeinterface as si
 import spikeinterface.extractors as se
-
+import psutil
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+def log_system_status():
+    """Log CPU, memory, and disk I/O stats."""
+    memory = psutil.virtual_memory()
+    io_counters = psutil.disk_io_counters()
+    logging.info(f"Memory Usage: {memory.percent}%")
+    logging.info(f"Disk Read: {io_counters.read_bytes / (1024**2):.2f} MB, "
+                 f"Disk Write: {io_counters.write_bytes / (1024**2):.2f} MB")
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -145,6 +153,7 @@ def process_rhd_file_batch(args_batch):
     batch_results = []
     for args in args_batch:
         result = process_rhd_file(args)
+        log_system_status()
         if result:
             batch_results.append(result)
     return batch_results
