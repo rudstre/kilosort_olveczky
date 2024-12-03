@@ -8,9 +8,10 @@ from glob import glob
 from datetime import datetime
 from tqdm import tqdm
 import multiprocessing
-from multiprocessing import Pool
 import spikeinterface as si
 import spikeinterface.extractors as se
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -149,23 +150,20 @@ def main(input_folder, output_folder, n_jobs, recursive):
     with tqdm(total=len(rhd_files), desc="Processing Files", position=0, leave=True) as progress_bar:
         args = [(file, file_datetime_formats) for file in rhd_files]
 
-        # Start multiprocessing pool
+        # Use ProcessPoolExecutor for parallel processing
         results = []
-        with Pool(n_jobs) as pool:
-            # Define callback for progress updates
-            def update_progress(result):
-                results.append(result)
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            # Submit tasks to the executor
+            future_to_file = {executor.submit(process_rhd_file, arg): arg for arg in args}
+
+            # Process completed futures as they finish
+            for future in as_completed(future_to_file):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    logging.error(f"Error processing file: {e}")
                 progress_bar.update(1)
-
-            # Use map_async for non-blocking processing
-            async_results = [
-                pool.apply_async(process_rhd_file, (arg,), callback=update_progress)
-                for arg in args
-            ]
-
-            # Wait for all tasks to complete
-            for async_result in async_results:
-                async_result.wait()
 
     # Combine and sort results by datetime
     all_recordings, all_metadata = [], []
