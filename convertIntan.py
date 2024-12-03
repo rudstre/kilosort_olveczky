@@ -1,25 +1,23 @@
-import os
-import re
-import json
-import shutil
 import logging
+import os
+import gc
+import re
 import argparse
-from glob import glob
+from queue import Queue
+from multiprocessing import Process, Queue as MPQueue, cpu_count
 from datetime import datetime
 
 import psutil
-from tqdm import tqdm
-import multiprocessing
 import spikeinterface as si
 import spikeinterface.extractors as se
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Set multiprocessing start method dynamically
-multiprocessing.set_start_method('spawn' if os.name == 'nt' else 'fork', force=True)
+# Initialize previous counters
+prev_read_bytes = 0
+prev_write_bytes = 0
+
 
 def get_process_memory_usage():
     """Get memory usage of the current process and its children."""
@@ -30,9 +28,6 @@ def get_process_memory_usage():
     return mem_usage
 
 
-# Initialize previous counters
-prev_read_bytes = 0
-prev_write_bytes = 0
 def log_system_status():
     global prev_read_bytes, prev_write_bytes
     process = psutil.Process(os.getpid())
@@ -50,6 +45,7 @@ def log_system_status():
     logging.info(f"Memory Usage: {memory / 1000:.2f}GB")
     logging.info(f"Process Disk Read since last check: {read_bytes / (1024**2):.2f} MB, "
                  f"Process Disk Write since last check: {write_bytes / (1024**2):.2f} MB")
+
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -75,14 +71,14 @@ def extract_datetime(name, datetime_format):
     match = re.search(regex_pattern, name)
     if not match:
         raise ValueError(f"No datetime matching format '{datetime_format}' found in '{name}'.")
-    return match.group()
+    return datetime.strptime(match.group(), datetime_format)
 
 
-def prompt_user_for_datetime_format(example_name, context):
+def prompt_user_for_datetime_format(example_name):
     """Prompt the user to enter the datetime format based on an example name."""
     print(
-        f"\nProvide the datetime format for the {context}.\n"
-        f"Example {context}: {example_name}\n"
+        f"Provide the datetime format for file names.\n"
+        f"Example file name: {example_name}\n"
         "Use Python datetime codes (e.g., '%y%m%d_%H%M%S' for '240830_145124')."
     )
     while True:
@@ -92,158 +88,117 @@ def prompt_user_for_datetime_format(example_name, context):
                 return datetime_format
         except ValueError:
             pass
-        logging.error(f"Invalid format '{datetime_format}'. Try again.")
+        print(f"Invalid format '{datetime_format}'. Try again.")
 
 
-def validate_output_folder(output_folder):
-    """Validate the output folder, deleting it if the user agrees."""
-    if os.path.exists(output_folder):
-        if input(f"Output folder '{output_folder}' exists. Delete it? (yes/no): ").strip().lower() == "yes":
-            shutil.rmtree(output_folder)
-            logging.info(f"Deleted existing output folder: {output_folder}")
-        else:
-            logging.info("Operation cancelled by user.")
-            exit()
+def producer_task(file_queue, batches):
+    """Producer task to enqueue batches of files."""
+    for batch in batches:
+        file_queue.put(batch)
+    file_queue.put(None)  # Signal end of tasks
 
 
-def save_metadata(metadata, output_folder):
-    """Save metadata to a JSON file."""
-    metadata_path = os.path.join(output_folder, "recording_metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=4)
-    logging.info(f"Metadata saved to {metadata_path}")
+def worker_task(file_queue, result_queue):
+    """Worker task to process batches."""
+    while True:
+        batch = file_queue.get()
+        if batch is None:
+            file_queue.put(None)  # Propagate end signal to other workers
+            break
+        try:
+            # Process the batch
+            recordings = [
+                se.read_intan(file, stream_id="0", ignore_integrity_checks=True)
+                for file in batch
+            ]
+            batch_concatenated = si.concatenate_recordings(recordings)
+            result_queue.put(batch_concatenated)
+        except Exception as e:
+            print(f"Error processing batch {batch}: {e}")
+        finally:
+            del recordings  # Free memory
+            gc.collect()
 
 
-def load_rhd_files(input_folder, recursive):
-    """Retrieve all .rhd files in the folder or subfolders based on the recursive flag."""
-    if recursive:
-        rhd_files = glob(os.path.join(input_folder, "**", "*.rhd"), recursive=True)
-    else:
-        rhd_files = glob(os.path.join(input_folder, "*.rhd"))
-    if not rhd_files:
-        raise ValueError("No .rhd files found.")
-    return rhd_files
-
-
-def process_rhd_file(args):
-    """Process a single .rhd file."""
-    file_path, file_datetime_formats = args
+def final_stage_task(result_queue, final_result_path, num_batches):
+    """Final stage to concatenate intermediate results."""
+    intermediate_results = []
+    for _ in range(num_batches):
+        result = result_queue.get()
+        intermediate_results.append(result)
     try:
-        logging.info(f"Before reading recording: {get_process_memory_usage():.2f} MB")
-        recording = se.read_intan(file_path, stream_id="0")
-        logging.info(f"After reading recording: {get_process_memory_usage():.2f} MB")
-
-        # Extract datetime from the file name
-        file_datetime = None
-        for fmt in file_datetime_formats:
-            try:
-                file_datetime_str = extract_datetime(os.path.basename(file_path), fmt)
-                file_datetime = datetime.strptime(file_datetime_str, fmt)
-                break
-            except ValueError:
-                continue
-
-        # If parsing fails, prompt user for new format
-        while not file_datetime:
-            new_format = prompt_user_for_datetime_format(os.path.basename(file_path), "file name")
-            file_datetime_formats.append(new_format)
-            try:
-                file_datetime_str = extract_datetime(os.path.basename(file_path), new_format)
-                file_datetime = datetime.strptime(file_datetime_str, new_format)
-            except ValueError:
-                continue
-
-        # Prepare metadata
-        num_samples = recording.get_num_frames()
-        logging.info(f"After getting num_frames: {get_process_memory_usage():.2f} MB")
-        metadata = {
-            "file_name": os.path.basename(file_path),
-            "start_sample": 0,
-            "end_sample": num_samples - 1,
-            "datetime": file_datetime.isoformat(),
-        }
-        log_system_status()
-        return recording, metadata
-
+        final_recording = si.concatenate_recordings(intermediate_results)
+        final_recording.save(folder=final_result_path, dtype="int16", format="binary")
+        print("Final concatenation complete!")
     except Exception as e:
-        logging.error(f"Error processing file {file_path}: {e}")
-        return None, None
+        print(f"Error during final concatenation: {e}")
+    finally:
+        del intermediate_results  # Free memory
+        gc.collect()
 
 
-def main(input_folder, output_folder, n_jobs, recursive):
-    # Load all .rhd files
-    rhd_files = load_rhd_files(input_folder, recursive)
+def main(input_folder, output_folder, batch_size, num_workers):
+    # Find all RHD files
+    rhd_files = [
+        os.path.join(root, file)
+        for root, _, files in os.walk(input_folder)
+        for file in files
+        if file.endswith(".rhd")
+    ]
 
-    # Example file for datetime format prompting
-    file_example = os.path.basename(rhd_files[0])
-    file_datetime_formats = [prompt_user_for_datetime_format(file_example, "file name")]
+    if not rhd_files:
+        print("No .rhd files found in the specified folder.")
+        return
 
-    # Validate output folder
-    validate_output_folder(output_folder)
+    # Prompt user for datetime format and sort files by datetime
+    datetime_format = prompt_user_for_datetime_format(os.path.basename(rhd_files[0]))
+    try:
+        rhd_files = sorted(
+            rhd_files,
+            key=lambda x: extract_datetime(os.path.basename(x), datetime_format),
+        )
+    except ValueError as e:
+        print(f"Error parsing datetime: {e}")
+        return
 
-    # Initialize progress bar
-    with tqdm(total=len(rhd_files), desc="Processing Files", position=0, leave=True) as progress_bar:
-        args = [(file, file_datetime_formats) for file in rhd_files]
+    # Split files into batches
+    batches = [rhd_files[i:i + batch_size] for i in range(0, len(rhd_files), batch_size)]
 
-        # Use ProcessPoolExecutor for parallel processing
-        results = []
-        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-            # Submit tasks to the executor
-            future_to_file = {executor.submit(process_rhd_file, arg): arg for arg in args}
+    # Queues for inter-process communication
+    file_queue = MPQueue()
+    result_queue = MPQueue()
 
-            # Process completed futures as they finish
-            for future in as_completed(future_to_file):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    logging.error(f"Error processing file: {e}")
-                progress_bar.update(1)
-                log_system_status()
+    # Start producer process
+    producer = Process(target=producer_task, args=(file_queue, batches))
+    producer.start()
 
+    # Start worker processes
+    workers = [
+        Process(target=worker_task, args=(file_queue, result_queue))
+        for _ in range(num_workers)
+    ]
+    for worker in workers:
+        worker.start()
 
-    # Combine and sort results by datetime
-    all_recordings, all_metadata = [], []
-    for recording, metadata in results:
-        if recording and metadata:
-            all_recordings.append((recording, metadata["datetime"]))
-            all_metadata.append(metadata)
+    # Start final stage process
+    final_stage = Process(target=final_stage_task, args=(result_queue, output_folder, len(batches)))
+    final_stage.start()
 
-    # Sort recordings and metadata by datetime
-    all_recordings.sort(key=lambda x: x[1])
-    all_metadata.sort(key=lambda x: x["datetime"])
+    # Wait for all processes to finish
+    producer.join()
+    for worker in workers:
+        worker.join()
+    final_stage.join()
 
-    # Extract sorted recordings
-    sorted_recordings = [rec[0] for rec in all_recordings]
-
-    # Concatenate recordings
-    if len(sorted_recordings) > 1:
-        concatenated_recording = si.concatenate_recordings(sorted_recordings)
-    elif sorted_recordings:
-        concatenated_recording = sorted_recordings[0]
-    else:
-        logging.error("No valid recordings found.")
-        exit()
-
-    # Save output
-    concatenated_recording.save(dtype="int16", format="binary", folder=output_folder, n_jobs=n_jobs)
-    save_metadata(all_metadata, output_folder)
-    logging.info("Process completed successfully.")
+    print("All tasks completed successfully!")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Concatenate .rhd recordings into a single file.")
-    parser.add_argument("-i", "--input", help="Input folder containing recordings.")
-    parser.add_argument("-o", "--output", help="Output folder for the concatenated recording.")
-    parser.add_argument("-j", "--jobs", type=int, default=multiprocessing.cpu_count(), help="Number of jobs (default: all cores).")
-    parser.add_argument("-r", "--recursive", action="store_true", help="Search for recordings in subfolders.")
-
+    parser = argparse.ArgumentParser(description="Flexible and scalable RHD file concatenation pipeline with datetime sorting.")
+    parser.add_argument("-i", "--input", required=True, help="Input folder containing RHD files.")
+    parser.add_argument("-o", "--output", required=True, help="Output folder for the concatenated recording.")
+    parser.add_argument("-b", "--batch_size", type=int, default=20, help="Batch size for processing files.")
+    parser.add_argument("-w", "--workers", type=int, default=cpu_count(), help="Number of worker processes.")
     args = parser.parse_args()
-    args.input = args.input or input("Enter the path to the input folder: ").strip()
-    while not os.path.isdir(args.input):
-        args.input = input("Invalid input folder. Try again: ").strip()
 
-    args.output = args.output or input("Enter the path for the output folder: ").strip()
-    args.recursive = args.recursive or input("Search for recordings in subfolders? (yes/no): ").strip().lower() in ("yes", "y")
-    main(args.input, args.output, args.jobs, args.recursive)
-    multiprocessing.active_children()
+    main(args.input, args.output, args.batch_size, args.workers)
