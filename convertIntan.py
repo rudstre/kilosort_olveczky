@@ -63,6 +63,7 @@ def worker_task(file_queue, result_queue, progress_queue):
         if batch is None:
             file_queue.put(None)  # Propagate end signal to other workers
             break
+        recordings = None  # Initialize the variable to avoid reference errors
         try:
             # Process the batch
             recordings = [
@@ -74,9 +75,11 @@ def worker_task(file_queue, result_queue, progress_queue):
         except Exception as e:
             print(f"Error processing batch {batch}: {e}")
         finally:
-            del recordings  # Free memory
+            if recordings is not None:
+                del recordings  # Free memory only if defined
             gc.collect()
             progress_queue.put(1)  # Update progress for batch completion
+
 
 def final_stage_task(result_queue, final_result_path, num_batches, progress_queue):
     """Final stage to concatenate intermediate results."""
