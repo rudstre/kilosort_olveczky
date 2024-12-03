@@ -1,3 +1,4 @@
+import logging
 import os
 import gc
 import re
@@ -7,6 +8,15 @@ from datetime import datetime
 from tqdm import tqdm
 import spikeinterface as si
 import spikeinterface.extractors as se
+
+
+def progress_updater(total_batches, progress_queue):
+    """Progress updater to handle progress bar updates."""
+    with tqdm(total=total_batches, desc="Processing Files") as pbar:
+        for _ in range(total_batches):
+            progress_queue.get()  # Wait for a signal from workers
+            pbar.update(1)
+
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -57,28 +67,29 @@ def producer_task(file_queue, batches, total_batches, progress_queue):
     file_queue.put(None)  # Signal end of tasks
 
 def worker_task(file_queue, result_queue, progress_queue):
-    """Worker task to process batches."""
+    """Worker task to process batches of files."""
     while True:
         batch = file_queue.get()
         if batch is None:
             file_queue.put(None)  # Propagate end signal to other workers
             break
-        recordings = None  # Initialize the variable to avoid reference errors
+        recordings = None  # Initialize to avoid reference errors
         try:
-            # Process the batch
+            # Read files and concatenate the recordings
             recordings = [
                 se.read_intan(file, stream_id="0", ignore_integrity_checks=True)
                 for file in batch
             ]
             batch_concatenated = si.concatenate_recordings(recordings)
-            result_queue.put(batch_concatenated)
+            result_queue.put(batch_concatenated)  # Send result to result queue
         except Exception as e:
-            print(f"Error processing batch {batch}: {e}")
+            logging.error(f"Error processing batch {batch}: {e}")
         finally:
+            # Free memory and signal progress
             if recordings is not None:
-                del recordings  # Free memory only if defined
+                del recordings
             gc.collect()
-            progress_queue.put(1)  # Update progress for batch completion
+            progress_queue.put(1)  # Signal batch completion to progress updater
 
 
 def final_stage_task(result_queue, final_result_path, num_batches, progress_queue):
@@ -114,47 +125,37 @@ def progress_bar_task(progress_queue, total_tasks, desc):
                 completed += update
             pbar.update(0)
 
-def main(input_folder, output_folder, batch_size, num_workers):
-    # Find all RHD files
-    rhd_files = [
-        os.path.join(root, file)
-        for root, _, files in os.walk(input_folder)
-        for file in files
-        if file.endswith(".rhd")
+def main(input_folder, batch_size, num_workers, output_file):
+    """Main function to manage the processing pipeline."""
+    # Load all .rhd files
+    file_list = [
+        os.path.join(input_folder, f)
+        for f in os.listdir(input_folder)
+        if f.endswith(".rhd")
     ]
+    file_list.sort()  # Sort files to preserve chronological order if filenames have datetime
 
-    if not rhd_files:
-        print("No .rhd files found in the specified folder.")
+    # Divide the file list into batches
+    file_batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
+    num_batches = len(file_batches)
+
+    if num_batches == 0:
+        logging.error("No files found for processing.")
         return
 
-    # Prompt user for datetime format and sort files by datetime
-    datetime_format = prompt_user_for_datetime_format(os.path.basename(rhd_files[0]))
-    try:
-        rhd_files = sorted(
-            rhd_files,
-            key=lambda x: extract_datetime(os.path.basename(x), datetime_format),
-        )
-    except ValueError as e:
-        print(f"Error parsing datetime: {e}")
-        return
+    # Create queues
+    file_queue = Queue()
+    result_queue = Queue()
+    progress_queue = Queue()
 
-    # Split files into batches
-    batches = [rhd_files[i:i + batch_size] for i in range(0, len(rhd_files), batch_size)]
-    total_batches = len(batches)
+    # Add batches to the file queue
+    for batch in file_batches:
+        file_queue.put(batch)
+    file_queue.put(None)  # Sentinel to signal end of processing
 
-    # Queues for inter-process communication
-    file_queue = MPQueue()
-    result_queue = MPQueue()
-    progress_queue = MPQueue()
-
-    # Start progress bar process
-    total_tasks = total_batches + (total_batches - 1)  # Batches + final concatenation steps
-    progress_bar = Process(target=progress_bar_task, args=(progress_queue, total_tasks, "Processing Files"))
-    progress_bar.start()
-
-    # Start producer process
-    producer = Process(target=producer_task, args=(file_queue, batches, total_batches, progress_queue))
-    producer.start()
+    # Start the progress updater process
+    progress_process = Process(target=progress_updater, args=(num_batches, progress_queue))
+    progress_process.start()
 
     # Start worker processes
     workers = [
@@ -164,27 +165,43 @@ def main(input_folder, output_folder, batch_size, num_workers):
     for worker in workers:
         worker.start()
 
-    # Start final stage process
-    final_stage = Process(target=final_stage_task, args=(result_queue, output_folder, total_batches, progress_queue))
-    final_stage.start()
+    # Collect results
+    concatenated_recordings = []
+    for _ in range(num_batches):
+        result = result_queue.get()
+        if result is not None:
+            concatenated_recordings.append(result)
 
-    # Wait for all processes to finish
-    producer.join()
+    # Wait for all workers to finish
     for worker in workers:
         worker.join()
-    final_stage.join()
-    progress_bar.join()
 
-    print("All tasks completed successfully!")
+    # Wait for progress updater to finish
+    progress_process.join()
+
+    # Final concatenation
+    if len(concatenated_recordings) > 1:
+        final_recording = si.concatenate_recordings(concatenated_recordings)
+    elif concatenated_recordings:
+        final_recording = concatenated_recordings[0]
+    else:
+        logging.error("No valid recordings to concatenate.")
+        return
+
+    # Save the final concatenated recording
+    final_recording.save(format="binary", folder=output_file)
+    logging.info(f"Final concatenated recording saved to {output_file}")
+
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Flexible and scalable RHD file concatenation pipeline with datetime sorting and progress bar.")
-    parser.add_argument("-i", "--input", required=True, help="Input folder containing RHD files.")
+    parser = argparse.ArgumentParser(description="Process and concatenate .rhd recordings.")
+    parser.add_argument("-i", "--input", required=True, help="Input folder containing .rhd files.")
     parser.add_argument("-o", "--output", required=True, help="Output folder for the concatenated recording.")
-    parser.add_argument("-b", "--batch_size", type=int, default=20, help="Batch size for processing files.")
-    parser.add_argument("-w", "--workers", type=int, default=cpu_count(), help="Number of worker processes.")
+    parser.add_argument("-b", "--batch-size", type=int, default=20, help="Number of files per batch.")
+    parser.add_argument("-w", "--workers", type=int, default=4, help="Number of worker processes.")
+
     args = parser.parse_args()
 
-    main(args.input, args.output, args.batch_size, args.workers)
+    main(args.input, args.batch_size, args.workers, args.output)
