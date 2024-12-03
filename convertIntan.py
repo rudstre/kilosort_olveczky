@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import re
 import json
@@ -6,10 +7,37 @@ import logging
 import argparse
 from glob import glob
 from datetime import datetime
+from itertools import islice
 from tqdm import tqdm
-import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import spikeinterface as si
 import spikeinterface.extractors as se
+import psutil
+import time
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Initialize previous counters
+prev_read_bytes = 0
+prev_write_bytes = 0
+def log_system_status():
+    global prev_read_bytes, prev_write_bytes
+    process = psutil.Process(os.getpid())
+    memory = psutil.virtual_memory()
+    io_counters = process.io_counters()
+
+    # Calculate incremental I/O
+    read_bytes = io_counters.read_bytes - prev_read_bytes
+    write_bytes = io_counters.write_bytes - prev_write_bytes
+
+    # Update previous counters
+    prev_read_bytes = io_counters.read_bytes
+    prev_write_bytes = io_counters.write_bytes
+
+    logging.info(f"Memory Usage: {memory.percent}%")
+    logging.info(f"Process Disk Read since last check: {read_bytes / (1024**2):.2f} MB, "
+                 f"Process Disk Write since last check: {write_bytes / (1024**2):.2f} MB")
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -28,6 +56,7 @@ def build_regex_from_format(datetime_format):
             i += 1
     return regex_pattern
 
+
 def extract_datetime(name, datetime_format):
     """Extract a datetime substring from a name using the provided format."""
     regex_pattern = build_regex_from_format(datetime_format)
@@ -35,6 +64,7 @@ def extract_datetime(name, datetime_format):
     if not match:
         raise ValueError(f"No datetime matching format '{datetime_format}' found in '{name}'.")
     return match.group()
+
 
 def prompt_user_for_datetime_format(example_name, context):
     """Prompt the user to enter the datetime format based on an example name."""
@@ -52,6 +82,7 @@ def prompt_user_for_datetime_format(example_name, context):
             pass
         logging.error(f"Invalid format '{datetime_format}'. Try again.")
 
+
 def validate_output_folder(output_folder):
     """Validate the output folder, deleting it if the user agrees."""
     if os.path.exists(output_folder):
@@ -61,7 +92,7 @@ def validate_output_folder(output_folder):
         else:
             logging.info("Operation cancelled by user.")
             exit()
-    os.makedirs(output_folder, exist_ok=True)
+
 
 def save_metadata(metadata, output_folder):
     """Save metadata to a JSON file."""
@@ -69,6 +100,7 @@ def save_metadata(metadata, output_folder):
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=4)
     logging.info(f"Metadata saved to {metadata_path}")
+
 
 def load_rhd_files(input_folder, recursive):
     """Retrieve all .rhd files in the folder or subfolders based on the recursive flag."""
@@ -80,10 +112,113 @@ def load_rhd_files(input_folder, recursive):
         raise ValueError("No .rhd files found.")
     return rhd_files
 
-def main(input_folder, output_folder, n_jobs, recursive):
-    # Set up logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+def process_rhd_file(args):
+    """Process a single .rhd file."""
+    file_path, file_datetime_formats = args
+    try:
+        recording = se.read_intan(file_path, stream_id="0", ignore_integrity_checks=True)
+
+        # Extract datetime from the file name
+        file_datetime = None
+        for fmt in file_datetime_formats:
+            try:
+                file_datetime_str = extract_datetime(os.path.basename(file_path), fmt)
+                file_datetime = datetime.strptime(file_datetime_str, fmt)
+                break
+            except ValueError:
+                continue
+
+        # If parsing fails, prompt user for new format
+        while not file_datetime:
+            new_format = prompt_user_for_datetime_format(os.path.basename(file_path), "file name")
+            file_datetime_formats.append(new_format)
+            try:
+                file_datetime_str = extract_datetime(os.path.basename(file_path), new_format)
+                file_datetime = datetime.strptime(file_datetime_str, new_format)
+            except ValueError:
+                continue
+
+        # Prepare metadata
+        num_samples = recording.get_num_frames()
+        metadata = {
+            "file_name": os.path.basename(file_path),
+            "start_sample": 0,
+            "end_sample": num_samples - 1,
+            "datetime": file_datetime.isoformat(),
+        }
+        return recording, metadata
+
+    except Exception as e:
+        logging.error(f"Error processing file {file_path}: {e}")
+        return None, None
+
+
+def chunked_iterable(iterable, size):
+    """Yield successive n-sized chunks from an iterable."""
+    it = iter(iterable)
+    while chunk := list(islice(it, size)):
+        yield chunk
+
+
+def process_and_concatenate_batches(rhd_files, file_datetime_formats, batch_size, output_folder, n_jobs):
+    """Process .rhd files in batches, concatenate them, and manage memory."""
+    all_metadata = []  # To collect metadata
+    concatenated_batches = []  # To store intermediate concatenated recordings
+
+    # Group files into smaller batches
+    file_batches = list(chunked_iterable(rhd_files, batch_size))
+
+    for batch_idx, file_batch in enumerate(file_batches):
+        logging.info(f"Processing batch {batch_idx + 1}/{len(file_batches)} with {len(file_batch)} files.")
+
+        # Process the current batch
+        batch_results = []
+        for file_path in file_batch:
+            result = process_rhd_file((file_path, file_datetime_formats))
+            log_system_status()
+            if result:
+                batch_results.append(result)
+
+        # Collect recordings and metadata
+        batch_recordings = []
+        for recording, metadata in batch_results:
+            if recording and metadata:
+                batch_recordings.append(recording)
+                all_metadata.append(metadata)
+
+        # Concatenate recordings in the batch
+        if len(batch_recordings) > 1:
+            concatenated_batch = si.concatenate_recordings(batch_recordings)
+        elif batch_recordings:
+            concatenated_batch = batch_recordings[0]
+        else:
+            logging.error(f"No valid recordings found in batch {batch_idx + 1}. Skipping.")
+            continue
+
+        # Store the concatenated batch
+        concatenated_batches.append(concatenated_batch)
+
+        # Explicitly delete intermediate objects to free memory
+        del batch_recordings
+        del batch_results
+        log_system_status()
+
+    # Final concatenation of all batches
+    if len(concatenated_batches) > 1:
+        final_concatenated = si.concatenate_recordings(concatenated_batches)
+    elif concatenated_batches:
+        final_concatenated = concatenated_batches[0]
+    else:
+        logging.error("No valid recordings found after processing all batches.")
+        return None, all_metadata
+
+    # Save the final concatenated recording
+    final_concatenated.save(dtype="int16", format="binary", folder=output_folder, n_jobs=n_jobs)
+    return final_concatenated, all_metadata
+
+
+def main(input_folder, output_folder, n_jobs, recursive):
     # Load all .rhd files
     rhd_files = load_rhd_files(input_folder, recursive)
 
@@ -94,107 +229,24 @@ def main(input_folder, output_folder, n_jobs, recursive):
     # Validate output folder
     validate_output_folder(output_folder)
 
-    # Initialize output file path
-    output_file_path = os.path.join(output_folder, "concatenated_recording.dat")
-
-    # Prepare metadata
-    all_metadata = []
-    start_sample = 0
-    num_channels = None
-    sampling_frequency = None
-    dtype = None
-
-    # Process files one by one
-    with open(output_file_path, 'wb') as output_file:
-        for file_path in tqdm(sorted(rhd_files), desc="Processing Files"):
-            try:
-                # Read the recording
-                recording = se.read_intan(file_path, stream_id="0", ignore_integrity_checks=True)
-
-                # Set sampling frequency, num_channels, dtype if not set
-                if sampling_frequency is None:
-                    sampling_frequency = recording.get_sampling_frequency()
-                else:
-                    if recording.get_sampling_frequency() != sampling_frequency:
-                        raise ValueError("Sampling frequency mismatch among recordings.")
-
-                if num_channels is None:
-                    num_channels = recording.get_num_channels()
-                else:
-                    if recording.get_num_channels() != num_channels:
-                        raise ValueError("Number of channels mismatch among recordings.")
-
-                if dtype is None:
-                    dtype = recording.get_dtype()
-                else:
-                    if recording.get_dtype() != dtype:
-                        raise ValueError("Data type mismatch among recordings.")
-
-                # Extract datetime from the file name
-                file_datetime = None
-                for fmt in file_datetime_formats:
-                    try:
-                        file_datetime_str = extract_datetime(os.path.basename(file_path), fmt)
-                        file_datetime = datetime.strptime(file_datetime_str, fmt)
-                        break
-                    except ValueError:
-                        continue
-
-                # If parsing fails, prompt user for new format
-                while not file_datetime:
-                    new_format = prompt_user_for_datetime_format(os.path.basename(file_path), "file name")
-                    file_datetime_formats.append(new_format)
-                    try:
-                        file_datetime_str = extract_datetime(os.path.basename(file_path), new_format)
-                        file_datetime = datetime.strptime(file_datetime_str, new_format)
-                    except ValueError:
-                        continue
-
-                # Get traces and write to output file
-                traces = recording.get_traces(return_scaled=False)
-                traces.tofile(output_file)
-
-                # Prepare metadata
-                num_samples = recording.get_num_frames()
-                metadata = {
-                    "file_name": os.path.basename(file_path),
-                    "start_sample": start_sample,
-                    "end_sample": start_sample + num_samples - 1,
-                    "datetime": file_datetime.isoformat(),
-                }
-                all_metadata.append(metadata)
-
-                # Update start_sample
-                start_sample += num_samples
-
-                # Clean up
-                del recording
-                del traces
-
-            except Exception as e:
-                logging.error(f"Error processing file {file_path}: {e}")
-
-    # Save metadata
-    save_metadata(all_metadata, output_folder)
-
-    # Create and save the BinaryRecordingExtractor
-    recording = si.BinaryRecordingExtractor(
-        file_paths=output_file_path,
-        sampling_frequency=sampling_frequency,
-        num_channels=num_channels,
-        dtype=dtype,
-        time_axis=0
+    # Process and concatenate recordings in batches
+    batch_size = 50  # Define batch size
+    final_recording, all_metadata = process_and_concatenate_batches(
+        rhd_files, file_datetime_formats, batch_size, output_folder, n_jobs
     )
-    # Save the recording object for future use
-    recording.save(folder=output_folder, format='binary')
 
-    logging.info("Process completed successfully.")
+    if final_recording:
+        save_metadata(all_metadata, output_folder)
+        logging.info("Process completed successfully.")
+    else:
+        logging.error("Processing failed. No valid output was produced.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Concatenate .rhd recordings into a single file.")
     parser.add_argument("-i", "--input", help="Input folder containing recordings.")
     parser.add_argument("-o", "--output", help="Output folder for the concatenated recording.")
-    parser.add_argument("-j", "--jobs", type=int, default=1, help="Number of jobs (default: 1).")
+    parser.add_argument("-j", "--jobs", type=int, default=multiprocessing.cpu_count(), help="Number of jobs (default: all cores).")
     parser.add_argument("-r", "--recursive", action="store_true", help="Search for recordings in subfolders.")
 
     args = parser.parse_args()
