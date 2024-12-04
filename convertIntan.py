@@ -1,7 +1,9 @@
 import os
 import logging
 import multiprocessing
-from multiprocessing import Queue
+from multiprocessing import cpu_count
+
+from spikeinterface.preprocessing import bandpass_filter, common_reference
 from tqdm import tqdm
 import spikeinterface as si
 import spikeinterface.extractors as se
@@ -9,6 +11,7 @@ import gc
 import re
 from datetime import datetime
 
+multiprocessing.set_start_method('spawn' if os.name == 'nt' else 'fork', force=True)
 
 def build_regex_from_format(datetime_format):
     """Convert a datetime format string into a regex pattern."""
@@ -104,12 +107,28 @@ def process_batches_in_parallel(file_batches, num_workers):
         return results
 
 
-def main(input_dir, batch_size, num_workers, output_file):
+def validate_output_folder(output_directory):
+    """Check if output folder exists and prompt for deletion."""
+    if os.path.exists(output_directory):
+        response = input(f"The folder '{output_directory}' already exists. Do you want to delete it? (yes/no): ").strip().lower()
+        if response in {"yes", "y"}:
+            import shutil
+            shutil.rmtree(output_directory)
+            logging.info(f"Deleted existing folder: {output_directory}")
+        else:
+            logging.error("Output folder already exists. Exiting to prevent overwriting data.")
+            exit()
+
+
+def main(input_directory, batch_size, num_workers, output_directory):
     """Main function to manage the processing pipeline."""
+    # Validate output folder
+    validate_output_folder(output_directory)
+
     # Recursively find .rhd files
     file_list = [
         os.path.join(root, file)
-        for root, _, files in os.walk(input_dir)
+        for root, _, files in os.walk(input_directory)
         for file in files if file.endswith(".rhd")
     ]
     if not file_list:
@@ -138,16 +157,18 @@ def main(input_dir, batch_size, num_workers, output_file):
 
     # Final concatenation
     if len(batch_results) > 1:
-        final_recording = si.concatenate_recordings(batch_results)
+        full_recording = si.concatenate_recordings(batch_results)
     elif batch_results:
-        final_recording = batch_results[0]
+        full_recording = batch_results[0]
     else:
         logging.error("No valid recordings to concatenate.")
         return
 
     # Save the final concatenated recording
-    final_recording.save(format="binary", folder=output_file, dtype="int16")
-    logging.info(f"Final concatenated recording saved to {output_file}")
+    recording_f = bandpass_filter(recording=full_recording, freq_min=300, freq_max=6000)
+    final_recording = common_reference(recording=recording_f, operator="median")
+    final_recording.save(format="binary", folder=output_directory, dtype="int16", n_jobs=os.cpu_count())
+    logging.info(f"Final concatenated recording saved to {output_directory}")
 
     # Final garbage collection
     del batch_results, final_recording
@@ -160,11 +181,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process and concatenate .rhd recordings.")
     parser.add_argument("-i", "--input", help="Input folder containing .rhd files.")
     parser.add_argument("-o", "--output", help="Output folder for the concatenated recording.")
-    parser.add_argument("-b", "--batch-size", type=int, default=20, help="Number of files per batch.")
-    parser.add_argument("-w", "--workers", type=int, default=48, help="Number of worker processes.")
+    parser.add_argument("-b", "--batch-size", type=int, default=10, help="Number of files per batch.")
+    parser.add_argument("-w", "--workers", type=int, default=3, help="Number of worker processes.")
 
     args = parser.parse_args()
-    input_folder = args.input or input("Enter input folder: ").strip()
-    output_folder = args.output or input("Enter output folder: ").strip()
 
-    main(input_folder, args.batch_size, args.workers, output_folder)
+    input_dir = args.input or input("Enter input folder: ").strip()
+    output_dir = args.output or input("Enter output folder: ").strip()
+
+    main(input_dir, args.batch_size, args.workers, output_dir)
