@@ -13,14 +13,19 @@ from glob import glob
 
 def progress_updater(total_batches, progress_queue):
     """Progress updater to handle progress bar updates."""
+    logging.info("Progress updater started.")
+    completed = 0
     with tqdm(total=total_batches, desc="Processing Files") as pbar:
-        for _ in range(total_batches):
+        while completed < total_batches:
             try:
-                progress_queue.get(timeout=60)  # Ensure progress updates are timely
+                update = progress_queue.get(timeout=60)  # Wait for signals
+                logging.info(f"Progress received: {update}")
+                completed += 1
                 pbar.update(1)
             except Exception as e:
                 logging.error(f"Progress updater failed: {e}")
                 break
+    logging.info("Progress updater finished.")
 
 
 def build_regex_from_format(datetime_format):
@@ -73,30 +78,36 @@ def producer_task(file_queue, batches, total_batches, progress_queue):
         file_queue.put(batch)
         progress_queue.put(1)  # Update progress
     file_queue.put(None)  # Signal end of tasks
+    logging.info(f"All batches added. Final file_queue size: {file_queue.qsize()}")
 
 
 def worker_task(file_queue, result_queue, progress_queue):
     """Worker task to process batches of files."""
+    logging.info("Worker started.")
     while True:
+        logging.info(f"file_queue size before dequeuing: {file_queue.qsize()}")
         batch = file_queue.get()
         if batch is None:
+            logging.info("Worker received termination signal.")
             file_queue.put(None)  # Propagate end signal to other workers
             break
         try:
-            # Read files and concatenate the recordings
+            # Process the batch
+            logging.info(f"Processing batch: {batch}")
             recordings = [
                 se.read_intan(file, stream_id="0", ignore_integrity_checks=True)
                 for file in batch
             ]
             batch_concatenated = si.concatenate_recordings(recordings)
-            result_queue.put(batch_concatenated)  # Send result to result queue
+            result_queue.put(batch_concatenated)
+            progress_queue.put(1)  # Signal progress
+            logging.info("Batch processed successfully.")
         except Exception as e:
             logging.error(f"Error processing batch {batch}: {e}")
         finally:
-            # Free memory and signal progress
             del recordings
             gc.collect()
-            progress_queue.put(1)  # Signal batch completion to progress updater
+    logging.info("Worker finished.")
 
 
 def main(input_folder=None, output_folder=None, batch_size=20, num_workers=4):
