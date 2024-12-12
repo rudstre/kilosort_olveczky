@@ -11,6 +11,7 @@ import multiprocessing
 from multiprocessing import Pool
 import spikeinterface as si
 import spikeinterface.extractors as se
+import spikeinterface.preprocessing as sp
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -190,8 +191,14 @@ def main(input_folder, output_folder, n_jobs, recursive):
         logging.error("No valid recordings found.")
         exit()
 
+    # Apply filtering and referencing
+    logging.info("Filtering raw data (bandpass and common reference)...")
+    recording_band = sp.bandpass_filter(recording=concatenated_recording, freq_min=300, freq_max=6000)
+    final_recording = sp.common_reference(recording=recording_band, operator="median")
+    logging.info("Data filtered.")
+
     # Save output
-    concatenated_recording.save(dtype="int16", format="binary", folder=output_folder, n_jobs=n_jobs)
+    final_recording.save(dtype="int16", format="binary", folder=output_folder, n_jobs=n_jobs)
     save_metadata(all_metadata, output_folder)
     logging.info("Process completed successfully.")
 
@@ -210,5 +217,6 @@ if __name__ == "__main__":
 
     args.output = args.output or input("Enter the path for the output folder: ").strip()
     args.recursive = args.recursive or input("Search for recordings in subfolders? (yes/no): ").strip().lower() in ("yes", "y")
+    logging.info(f"Using {args.jobs} core(s) for job.")
     main(args.input, args.output, args.jobs, args.recursive)
     multiprocessing.active_children()
