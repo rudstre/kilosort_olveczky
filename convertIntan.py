@@ -194,9 +194,51 @@ def main(input_folder, output_folder, n_jobs, recursive, channel_order=None, min
     file_example = os.path.basename(rhd_files[0])
     # Use provided formats if available, otherwise prompt
     file_datetime_formats = datetime_formats or [prompt_user_for_datetime_format(file_example, "file name")]
+    
+    # Pre-filter files by datetime if filters are specified
+    if min_datetime is not None or max_datetime is not None:
+        logging.info("Pre-filtering files by datetime range...")
+        filtered_files = []
+        skipped_count = 0
+        
+        for file_path in tqdm(rhd_files, desc="Filtering files"):
+            try:
+                # Extract datetime from the file name
+                file_datetime = None
+                for fmt in file_datetime_formats:
+                    try:
+                        file_datetime_str = extract_datetime(os.path.basename(file_path), fmt)
+                        file_datetime = datetime.strptime(file_datetime_str, fmt)
+                        break
+                    except ValueError:
+                        continue
+                
+                # Skip file if outside datetime range
+                if file_datetime:
+                    if (min_datetime and file_datetime < min_datetime) or (max_datetime and file_datetime > max_datetime):
+                        skipped_count += 1
+                        continue
+                    filtered_files.append(file_path)
+                else:
+                    # If can't parse datetime, include the file to be safe
+                    filtered_files.append(file_path)
+            except Exception as e:
+                logging.debug(f"Error pre-filtering file {file_path}: {e}")
+                # Include file if there's an error parsing datetime
+                filtered_files.append(file_path)
+        
+        logging.info(f"Pre-filtered {skipped_count} files outside the datetime range.")
+        logging.info(f"Processing {len(filtered_files)} files that match the datetime range.")
+        
+        # Use filtered files for processing
+        rhd_files = filtered_files
 
     # Validate output folder
     validate_output_folder(output_folder)
+    
+    if not rhd_files:
+        logging.error("No valid recordings found within the specified datetime range.")
+        exit()
 
     # Initialize progress bar
     with tqdm(total=len(rhd_files), desc="Processing Files", position=0, leave=True) as progress_bar:
@@ -220,22 +262,15 @@ def main(input_folder, output_folder, n_jobs, recursive, channel_order=None, min
             for async_result in async_results:
                 async_result.wait()
 
-    # Combine and sort results by datetime
+    # Combine results
     all_recordings, all_metadata = [], []
     for recording, metadata in results:
         if recording and metadata:
-            file_datetime = datetime.fromisoformat(metadata["datetime"])
-            
-            # Filter by datetime if specified
-            if (min_datetime and file_datetime < min_datetime) or (max_datetime and file_datetime > max_datetime):
-                logging.info(f"Skipping {metadata['file_name']} - outside of datetime range")
-                continue
-                
             all_recordings.append((recording, metadata["datetime"]))
             all_metadata.append(metadata)
 
     if not all_recordings:
-        logging.error("No valid recordings found within the specified datetime range.")
+        logging.error("No valid recordings found.")
         exit()
 
     # Sort recordings and metadata by datetime
@@ -245,7 +280,7 @@ def main(input_folder, output_folder, n_jobs, recursive, channel_order=None, min
     # Log the selected date range
     if min_datetime or max_datetime:
         date_range = f"from {min_datetime.isoformat() if min_datetime else 'earliest'} to {max_datetime.isoformat() if max_datetime else 'latest'}"
-        logging.info(f"Processing {len(all_recordings)} files {date_range}")
+        logging.info(f"Concatenating {len(all_recordings)} files {date_range}")
 
     # Extract sorted recordings
     sorted_recordings = [rec[0] for rec in all_recordings]
