@@ -1,0 +1,14 @@
+cython
+dask
+osqp
+h5py
+joblib
+pillow
+pyopengl
+pyqtwebengine
+qtconsole
+requests
+responses
+traitlets
+git+https://github.com/cortex-lab/phy.git
+-e .[gui]
