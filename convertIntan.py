@@ -1,9 +1,11 @@
 import os
 import re
 import json
+import shlex
 import shutil
 import logging
 import argparse
+import numpy as np
 from glob import glob
 from datetime import datetime
 from tqdm import tqdm
@@ -48,11 +50,21 @@ def extract_datetime(name, datetime_format):
 
 
 def prompt_user_for_datetime_format(example_name, context):
-    """Prompt the user to enter the datetime format based on an example name."""
+    """Try default format first, then prompt the user to enter the datetime format if needed."""
+    # Try the default format first (%y%m%d_%H%M%S)
+    default_format = "%y%m%d_%H%M%S"
+    try:
+        if re.search(build_regex_from_format(default_format), example_name):
+            logging.info(f"Using default datetime format '{default_format}' for {context}")
+            return default_format
+    except ValueError:
+        pass
+    
+    # If default format doesn't work, prompt the user
     print(
-        f"\nProvide the datetime format for the {context}.\n"
+        f"\nCould not parse {context} with default format '%y%m%d_%H%M%S'.\n"
         f"Example {context}: {example_name}\n"
-        "Use Python datetime codes (e.g., '%y%m%d_%H%M%S' for '240830_145124')."
+        "Please provide the datetime format using Python datetime codes."
     )
     while True:
         datetime_format = input("Enter the datetime format: ").strip()
@@ -135,13 +147,53 @@ def process_rhd_file(args):
         return None, None
 
 
-def main(input_folder, output_folder, n_jobs, recursive):
+def reorder_channels(recording, channel_order):
+    """Reorder channels in the recording based on the specified order."""
+    if channel_order is None:
+        return recording
+        
+    logging.info("Reordering channels based on provided channel order...")
+    
+    # Get the actual channel IDs from the recording
+    all_channel_ids = recording.get_channel_ids()
+    n_channels = recording.get_num_channels()
+    
+    # Validate the channel order indices
+    if max(channel_order) >= n_channels or min(channel_order) < 0:
+        raise ValueError(f"Channel indices must be in range [0, {n_channels-1}]")
+    
+    # Check if the channel order has the right number of channels
+    if len(channel_order) < n_channels:
+        # If user provided fewer indices than channels, ask if they want to proceed with only those channels
+        missing_count = n_channels - len(channel_order)
+        logging.warning(f"Channel order contains only {len(channel_order)} indices but recording has {n_channels} channels.")
+        logging.warning(f"This will result in {missing_count} channels being dropped from the output.")
+        
+        if input("Continue with partial channel selection? (yes/no): ").strip().lower() != "yes":
+            raise ValueError("Channel reordering cancelled by user.")
+    
+    # Map numeric indices to actual channel IDs
+    try:
+        channel_ids_to_use = [all_channel_ids[idx] for idx in channel_order if idx < n_channels]
+        
+        # Use SpikeInterface's SubRecordingExtractor to reorder channels using the IDs
+        reordered_recording = recording.channel_slice(channel_ids_to_use)
+        logging.info(f"Channels reordered successfully. Output has {len(channel_ids_to_use)} channels.")
+        
+        return reordered_recording
+    except Exception as e:
+        logging.error(f"Error during channel reordering: {str(e)}")
+        raise ValueError(f"Failed to reorder channels: {str(e)}")
+
+
+def main(input_folder, output_folder, n_jobs, recursive, channel_order=None, min_datetime=None, max_datetime=None, datetime_formats=None):
     # Load all .rhd files
     rhd_files = load_rhd_files(input_folder, recursive)
 
     # Example file for datetime format prompting
     file_example = os.path.basename(rhd_files[0])
-    file_datetime_formats = [prompt_user_for_datetime_format(file_example, "file name")]
+    # Use provided formats if available, otherwise prompt
+    file_datetime_formats = datetime_formats or [prompt_user_for_datetime_format(file_example, "file name")]
 
     # Validate output folder
     validate_output_folder(output_folder)
@@ -172,12 +224,28 @@ def main(input_folder, output_folder, n_jobs, recursive):
     all_recordings, all_metadata = [], []
     for recording, metadata in results:
         if recording and metadata:
+            file_datetime = datetime.fromisoformat(metadata["datetime"])
+            
+            # Filter by datetime if specified
+            if (min_datetime and file_datetime < min_datetime) or (max_datetime and file_datetime > max_datetime):
+                logging.info(f"Skipping {metadata['file_name']} - outside of datetime range")
+                continue
+                
             all_recordings.append((recording, metadata["datetime"]))
             all_metadata.append(metadata)
+
+    if not all_recordings:
+        logging.error("No valid recordings found within the specified datetime range.")
+        exit()
 
     # Sort recordings and metadata by datetime
     all_recordings.sort(key=lambda x: x[1])
     all_metadata.sort(key=lambda x: x["datetime"])
+
+    # Log the selected date range
+    if min_datetime or max_datetime:
+        date_range = f"from {min_datetime.isoformat() if min_datetime else 'earliest'} to {max_datetime.isoformat() if max_datetime else 'latest'}"
+        logging.info(f"Processing {len(all_recordings)} files {date_range}")
 
     # Extract sorted recordings
     sorted_recordings = [rec[0] for rec in all_recordings]
@@ -190,6 +258,16 @@ def main(input_folder, output_folder, n_jobs, recursive):
     else:
         logging.error("No valid recordings found.")
         exit()
+        
+    # Apply channel reordering if specified
+    if channel_order:
+        try:
+            concatenated_recording = reorder_channels(concatenated_recording, channel_order)
+        except ValueError as e:
+            logging.error(f"Channel reordering failed: {e}")
+            if input("Continue without channel reordering? (yes/no): ").strip().lower() != "yes":
+                logging.info("Operation cancelled by user.")
+                exit()
 
     # Apply filtering and referencing
     logging.info("Filtering raw data (bandpass and common reference)...")
@@ -197,10 +275,59 @@ def main(input_folder, output_folder, n_jobs, recursive):
     final_recording = sp.common_reference(recording=recording_band, operator="median")
     logging.info("Data filtered.")
 
+    # Save channel order information in metadata if used
+    processing_metadata = {
+        "processing_info": {
+            "datetime_range": {
+                "min_datetime": min_datetime.isoformat() if min_datetime else None,
+                "max_datetime": max_datetime.isoformat() if max_datetime else None
+            }
+        }
+    }
+    
+    if channel_order:
+        processing_metadata["processing_info"]["channel_order"] = {
+            "channel_order_used": True,
+            "channel_order": channel_order.tolist() if isinstance(channel_order, np.ndarray) else list(channel_order)
+        }
+    
+    all_metadata.append(processing_metadata)
+
     # Save output
     final_recording.save(dtype="int16", format="binary", folder=output_folder, n_jobs=n_jobs)
     save_metadata(all_metadata, output_folder)
     logging.info("Process completed successfully.")
+
+
+def parse_datetime(datetime_str, format_str=None):
+    """Parse a datetime string with multiple format attempts."""
+    if not datetime_str:
+        return None
+        
+    if format_str:
+        try:
+            return datetime.strptime(datetime_str, format_str)
+        except ValueError:
+            pass
+    
+    # Try common formats, with our preferred default first
+    formats = [
+        "%y%m%d_%H%M%S",  # Our default format (e.g., 240830_145124)
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y",
+        "%Y%m%d_%H%M%S",
+        "%Y%m%d"
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(datetime_str, fmt)
+        except ValueError:
+            continue
+            
+    raise ValueError(f"Could not parse datetime: {datetime_str}. Please provide a format like 'YYYY-MM-DD HH:MM:SS'.")
 
 
 if __name__ == "__main__":
@@ -209,14 +336,183 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", help="Output folder for the concatenated recording.")
     parser.add_argument("-j", "--jobs", type=int, default=multiprocessing.cpu_count(), help="Number of jobs (default: all cores).")
     parser.add_argument("-r", "--recursive", action="store_true", help="Search for recordings in subfolders.")
+    parser.add_argument("--min-datetime", help="Minimum datetime to include (format: YYYY-MM-DD HH:MM:SS)")
+    parser.add_argument("--max-datetime", help="Maximum datetime to include (format: YYYY-MM-DD HH:MM:SS)")
 
     args = parser.parse_args()
-    args.input = args.input or input("Enter the path to the input folder: ").strip()
+    
+    # Helper function to sanitize path inputs
+    def sanitize_path(path):
+        """
+        Sanitizes a path string by:
+        1. Removing surrounding quotes (both single and double)
+        2. Expanding user directories (~/...)
+        3. Resolving environment variables ($HOME/...)
+        4. Converting to absolute path if needed
+        """
+        if not path:
+            return path
+            
+        # Strip whitespace
+        path = path.strip()
+        
+        try:
+            # Use shlex to parse shell-like syntax, including quotes
+            if path.startswith('"') or path.startswith("'") or "\\'" in path or '\\"' in path:
+                try:
+                    path = shlex.split(path)[0]
+                except Exception:
+                    # If shlex fails, try simple quote stripping
+                    if (path.startswith('"') and path.endswith('"')) or (path.startswith("'") and path.endswith("'")):
+                        path = path[1:-1]
+        except Exception as e:
+            logging.warning(f"Error parsing path quotes: {e}")
+        
+        # Expand user directory (~/...)
+        path = os.path.expanduser(path)
+        
+        # Expand environment variables ($HOME/...)
+        path = os.path.expandvars(path)
+        
+        return path
+    
+    # Get and sanitize input folder path
+    args.input = sanitize_path(args.input or input("Enter the path to the input folder: ").strip())
     while not os.path.isdir(args.input):
-        args.input = input("Invalid input folder. Try again: ").strip()
+        print(f"Invalid input folder: '{args.input}'")
+        args.input = sanitize_path(input("Please enter a valid path: ").strip())
 
-    args.output = args.output or input("Enter the path for the output folder: ").strip()
+    # Get and sanitize output folder path
+    args.output = sanitize_path(args.output or input("Enter the path for the output folder: ").strip())
     args.recursive = args.recursive or input("Search for recordings in subfolders? (yes/no): ").strip().lower() in ("yes", "y")
+    
+    # Process datetime filters
+    min_datetime = None
+    max_datetime = None
+    file_datetime_formats = []  # Store datetime formats to reuse
+    
+    # Analyze all available recordings to show time range
+    try:
+        print("\nAnalyzing recording files in folder...")
+        rhd_files = load_rhd_files(args.input, args.recursive)
+        if not rhd_files:
+            print("No recording files found.")
+            exit()
+            
+        # Process first file to determine date format
+        file_example = os.path.basename(rhd_files[0])
+        # Store the datetime format to reuse later during processing
+        file_datetime_formats = [prompt_user_for_datetime_format(file_example, "file name")]
+        
+        # Get datetimes from all files
+        file_datetimes = []
+        for file_path in tqdm(rhd_files, desc="Reading file dates"):
+            try:
+                # Extract datetime from the file name without reading the whole file
+                for fmt in file_datetime_formats:
+                    try:
+                        file_datetime_str = extract_datetime(os.path.basename(file_path), fmt)
+                        file_datetime = datetime.strptime(file_datetime_str, fmt)
+                        file_datetimes.append(file_datetime)
+                        break
+                    except ValueError:
+                        continue
+            except Exception as e:
+                logging.debug(f"Error extracting datetime from {file_path}: {e}")
+        
+        if file_datetimes:
+            earliest = min(file_datetimes)
+            latest = max(file_datetimes)
+            print(f"\nRecordings in folder span from {earliest} to {latest}")
+            print(f"Total recording files: {len(file_datetimes)}")
+        else:
+            print("Could not determine date range from file names.")
+    except Exception as e:
+        logging.error(f"Error analyzing file dates: {e}")
+    
+    use_datetime_filter = input("\nDo you want to filter recordings by datetime? (yes/no): ").strip().lower() in ("yes", "y")
+    if use_datetime_filter:
+        # Prompt for min datetime
+        min_datetime_str = args.min_datetime or input("Enter minimum datetime (leave blank for none): ").strip()
+        if min_datetime_str:
+            try:
+                min_datetime = parse_datetime(min_datetime_str)
+                print(f"Using minimum datetime: {min_datetime}")
+            except ValueError as e:
+                print(f"Error: {str(e)}")
+                custom_format = input("Enter your datetime format (e.g., %Y-%m-%d %H:%M:%S): ").strip()
+                if custom_format:
+                    min_datetime = parse_datetime(min_datetime_str, custom_format)
+                    print(f"Using minimum datetime: {min_datetime}")
+        
+        # Prompt for max datetime
+        max_datetime_str = args.max_datetime or input("Enter maximum datetime (leave blank for none): ").strip()
+        if max_datetime_str:
+            try:
+                max_datetime = parse_datetime(max_datetime_str)
+                print(f"Using maximum datetime: {max_datetime}")
+            except ValueError as e:
+                print(f"Error: {str(e)}")
+                custom_format = input("Enter your datetime format (e.g., %Y-%m-%d %H:%M:%S): ").strip()
+                if custom_format:
+                    max_datetime = parse_datetime(max_datetime_str, custom_format)
+                    print(f"Using maximum datetime: {max_datetime}")
+    
+    # Interactive channel order input
+    channel_order = None
+    use_channel_order = input("Do you want to reorder channels? (yes/no): ").strip().lower() in ("yes", "y")
+    if use_channel_order:
+        # First, let's determine the number of channels from the first recording
+        try:
+            first_file = load_rhd_files(args.input, args.recursive)[0]
+            first_recording = se.read_intan(first_file, stream_id="0", ignore_integrity_checks=True)
+            n_channels = first_recording.get_num_channels()
+            channel_ids = first_recording.get_channel_ids()
+            
+            print(f"\nThe recording has {n_channels} channels (0-{n_channels-1}).")
+            
+            # Show the mapping between indices and channel IDs
+            print("\nChannel index to Channel ID mapping:")
+            for i, channel_id in enumerate(channel_ids):
+                print(f"  Index {i:2d} -> Channel ID: {channel_id}")
+            
+            print("\nEnter channel order as a Python list of indices (e.g., [1, 0, 3, 2] to swap channels 0/1 and 2/3)")
+            print("You don't need to include all channels - missing channels will be dropped from the output.")
+            
+            while True:
+                try:
+                    channel_order_input = input("\nChannel order: ").strip()
+                    # Evaluate the input as a Python expression (list or array)
+                    channel_order = eval(channel_order_input)
+                    
+                    # Convert to list if it's not already
+                    if isinstance(channel_order, (list, tuple, np.ndarray)):
+                        channel_order = list(channel_order)
+                    else:
+                        raise ValueError("Input must be a list, tuple, or array of channel indices")
+                    
+                    # Basic validation
+                    if not all(isinstance(idx, (int, np.integer)) for idx in channel_order):
+                        raise ValueError("All elements must be integers")
+                    
+                    if max(channel_order) >= n_channels or min(channel_order) < 0:
+                        raise ValueError(f"Channel indices must be in range [0, {n_channels-1}]")
+                    
+                    # Show the mapping for the selected order
+                    print("\nSelected channel order:")
+                    for new_idx, orig_idx in enumerate(channel_order):
+                        print(f"  New index {new_idx:2d} <- Original index {orig_idx:2d} (ID: {channel_ids[orig_idx]})")
+                    
+                    # Confirm with user
+                    if input("\nIs this channel order correct? (yes/no): ").strip().lower() in ("yes", "y"):
+                        break
+                except Exception as e:
+                    print(f"Error: {str(e)}. Please try again.")
+        except Exception as e:
+            logging.error(f"Error determining channel count or parsing channel order: {e}")
+            logging.info("Continuing without channel reordering.")
+    
     logging.info(f"Using {args.jobs} core(s) for job.")
-    main(args.input, args.output, args.jobs, args.recursive)
+    # Pass the stored datetime formats to avoid prompting again
+    main(args.input, args.output, args.jobs, args.recursive, channel_order, min_datetime, max_datetime, file_datetime_formats)
     multiprocessing.active_children()

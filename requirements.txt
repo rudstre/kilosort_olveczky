@@ -1,0 +1,22 @@
+spikeinterface[full]
+kilosort[gui]
+cython
+dask
+osqp
+h5py
+joblib
+matplotlib
+numpy
+pillow
+pip
+pyopengl
+pyqt6
+pyqtwebengine
+pytest
+qtconsole
+requests
+responses
+scikit-learn
+scipy
+traitlets
+git+https://github.com/cortex-lab/phy.git; sys_platform != "darwin"
