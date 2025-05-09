@@ -320,41 +320,6 @@ def create_processing_metadata(
         }
     }
 
-
-def get_optimal_chunk_memory(n_jobs=1):
-    """
-    Calculate optimal chunk_memory based on available free system memory and number of jobs.
-    
-    Args:
-        n_jobs: Number of parallel jobs that will be used
-        
-    Returns:
-        str: Memory size string (e.g., "500M", "2G")
-    """
-    # Get free system memory in MB
-    free_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
-    logger.info(f"Detected {free_memory_mb:.1f} MB of free memory")
-    
-    # Calculate available memory per job (with safety margin)
-    memory_per_job = free_memory_mb / (n_jobs * 1.5)  # 1.5 factor as safety margin
-    
-    # Calculate chunk size (30% of memory per job)
-    chunk_size_mb = int(memory_per_job * 0.1)
-    
-    # Ensure chunk size is within reasonable bounds
-    chunk_size_mb = max(100, min(chunk_size_mb, 8192))
-    
-    # Convert to appropriate units (M or G)
-    if chunk_size_mb >= 1024:
-        chunk_size_gb = chunk_size_mb / 1024
-        result = f"{int(chunk_size_gb)}G"
-    else:
-        result = f"{int(chunk_size_mb)}M"
-        
-    logger.info(f"Using {result} chunk size per job (with {n_jobs} jobs)")
-    return result
-
-
 def gather_parameters() -> Dict[str, Any]:
     parser = argparse.ArgumentParser(description="Convert Intan .rhd recordings to binary format.")
     parser.add_argument('-i', '--input',           type=Path,                   help='Input folder containing recordings')
@@ -534,12 +499,8 @@ def main(
     
     processed = preprocess_recording(final_rec)
 
-    # Calculate optimal chunk size based on available memory
-    chunk_memory = get_optimal_chunk_memory(n_jobs)
-    logger.info(f"Using chunk_memory={chunk_memory} for saving")
-
     logger.info(f"Saving processed recording to {output_folder}")
-    processed.save(dtype="int16", format="binary", folder=str(output_folder), n_jobs=n_jobs, chunk_memory=chunk_memory)
+    processed.save(dtype="int16", format="binary", folder=str(output_folder), n_jobs=n_jobs)
 
     all_meta = {
         "files": updated,
