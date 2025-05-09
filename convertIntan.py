@@ -29,7 +29,7 @@ import logging
 import argparse
 import ast
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.parser import parse as dateutil_parse
 from tqdm import tqdm
 import multiprocessing
@@ -38,6 +38,9 @@ import spikeinterface as si
 import spikeinterface.extractors as se
 import spikeinterface.preprocessing as sp
 from typing import List, Tuple, Optional, Dict, Any
+import os
+import numpy as np
+import psutil
 
 # Configure root logger once
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -93,36 +96,77 @@ def build_regex_from_format(datetime_format: str) -> str:
 
 
 def extract_datetime_from_name(name: str, formats: List[str]) -> datetime:
-    try:
-        return dateutil_parse(name, fuzzy=True)
-    except ValueError:
-        pass
+    """Extract datetime from a filename using provided format patterns."""
+    # First try with specific formats (more reliable)
     for fmt in formats:
-        regex = build_regex_from_format(fmt)
-        match = re.search(regex, name)
+        pattern = build_regex_from_format(fmt)
+        match = re.search(pattern, name)
         if match:
             try:
-                return datetime.strptime(match.group(), fmt)
-            except ValueError:
+                dt_str = match.group()
+                logger.debug(f"Found datetime pattern '{dt_str}' in '{name}' using format '{fmt}'")
+                return datetime.strptime(dt_str, fmt)
+            except ValueError as e:
+                logger.debug(f"Failed to parse '{match.group()}' with format '{fmt}': {e}")
                 continue
+    
+    # If specific formats fail, try fuzzy parsing as fallback
+    try:
+        parsed = dateutil_parse(name, fuzzy=True)
+        logger.debug(f"Extracted datetime {parsed} from '{name}' using fuzzy parsing")
+        return parsed
+    except ValueError as e:
+        logger.debug(f"Fuzzy parsing failed for '{name}': {e}")
+    
+    # If all methods fail
     raise ValueError(f"No datetime matching formats {formats} found in '{name}'")
 
 
 def parse_datetime(datetime_str: str, format_str: Optional[str] = None) -> datetime:
+    """Parse a datetime string with multiple format attempts."""
     if not datetime_str:
         raise ValueError("Empty datetime string")
+    
+    # Log what we're attempting to parse
+    logger.debug(f"Parsing datetime string: '{datetime_str}'")
+    
+    # Try with the specified format first if provided
     if format_str:
         try:
-            return datetime.strptime(datetime_str, format_str)
-        except ValueError:
-            pass
-    for fmt in ("%y%m%d_%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
-                "%m/%d/%Y %H:%M:%S", "%m/%d/%Y", "%Y%m%d"):
+            result = datetime.strptime(datetime_str, format_str)
+            logger.debug(f"Successfully parsed with provided format '{format_str}'")
+            return result
+        except ValueError as e:
+            logger.debug(f"Failed to parse with format '{format_str}': {e}")
+    
+    # Try with common formats
+    common_formats = [
+        "%y%m%d_%H%M%S",   # e.g., 250302_092921
+        "%Y-%m-%d %H:%M:%S", # e.g., 2025-03-02 09:29:21
+        "%Y-%m-%d",        # e.g., 2025-03-02
+        "%m/%d/%Y %H:%M:%S", # e.g., 03/02/2025 09:29:21
+        "%m/%d/%Y",        # e.g., 03/02/2025
+        "%Y%m%d",          # e.g., 20250302
+    ]
+    
+    for fmt in common_formats:
         try:
-            return datetime.strptime(datetime_str, fmt)
+            result = datetime.strptime(datetime_str, fmt)
+            logger.debug(f"Successfully parsed with format '{fmt}'")
+            return result
         except ValueError:
             continue
-    raise ValueError(f"Could not parse datetime: {datetime_str}")
+    
+    # As a last resort, try dateutil's parser
+    try:
+        result = dateutil_parse(datetime_str)
+        logger.debug(f"Successfully parsed with dateutil: {result}")
+        return result
+    except ValueError as e:
+        logger.debug(f"dateutil parsing failed: {e}")
+    
+    # If all methods fail
+    raise ValueError(f"Could not parse datetime: '{datetime_str}'")
 
 
 def sanitize_path(path_str: str) -> Path:
@@ -138,16 +182,21 @@ def load_rhd_files(input_folder: Path, recursive: bool) -> List[Path]:
     return files
 
 
-def validate_output_folder(output_folder: Path, force: bool, interactive: bool) -> None:
+def validate_output_folder(output_folder: Path, force: bool) -> None:
+    """Validate and potentially delete the output folder before writing."""
     if output_folder.exists():
         if force:
             shutil.rmtree(output_folder)
             logger.info(f"Deleted existing output folder: {output_folder}")
-        elif interactive and yes_no(f"Output folder '{output_folder}' exists. Delete it?"):
+        elif yes_no(f"Output folder '{output_folder}' exists. Delete it?"):
             shutil.rmtree(output_folder)
             logger.info(f"Deleted existing output folder: {output_folder}")
         else:
-            raise RuntimeError("Existing output folder not cleared")
+            raise RuntimeError(f"Output folder '{output_folder}' exists and you chose not to delete it.")
+    
+    # Create parent directories if needed
+    os.makedirs(output_folder.parent, exist_ok=True)
+    logger.info(f"Output will be saved to: {output_folder}")
 
 
 def filter_files_by_datetime(
@@ -156,20 +205,59 @@ def filter_files_by_datetime(
     min_dt: Optional[datetime],
     max_dt: Optional[datetime],
 ) -> List[Path]:
+    """Filter .rhd files based on datetime range in their filenames."""
+    # Quick return if no filters
     if not (min_dt or max_dt):
         return rhd_files
+    
+    # Log the filtering criteria
+    if min_dt:
+        logger.info(f"Filtering files with datetime >= {min_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    if max_dt:
+        logger.info(f"Filtering files with datetime <= {max_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    
     filtered = []
     skipped = 0
+    error_count = 0
+    
+    # Process each file
+    logger.info(f"Checking {len(rhd_files)} files for date filtering...")
+    
     for f in tqdm(rhd_files, desc="Filtering files by datetime"):
         try:
             dt = extract_datetime_from_name(f.name, datetime_formats)
-            if (min_dt and dt < min_dt) or (max_dt and dt > max_dt):
+            
+            # Now at INFO level for important files
+            if min_dt and dt < min_dt:
+                logger.info(f"SKIP: {f.name} - date {dt.strftime('%Y-%m-%d %H:%M:%S')} is before min date")
                 skipped += 1
                 continue
-        except ValueError:
-            pass
-        filtered.append(f)
-    logger.info(f"Skipped {skipped} files outside datetime range; {len(filtered)} remain.")
+            if max_dt and dt > max_dt:
+                logger.info(f"SKIP: {f.name} - date {dt.strftime('%Y-%m-%d %H:%M:%S')} is after max date")
+                skipped += 1
+                continue
+                
+            # File passed date filtering
+            logger.info(f"KEEP: {f.name} - date {dt.strftime('%Y-%m-%d %H:%M:%S')} is within range")
+            filtered.append(f)
+            
+        except ValueError as e:
+            error_count += 1
+            logger.warning(f"ERROR: {f.name} - {e}")
+    
+    # Print clear summary with stars for emphasis
+    logger.info("*" * 40)
+    logger.info(f"DATE FILTERING SUMMARY:")
+    logger.info(f"  - Files checked: {len(rhd_files)}")
+    logger.info(f"  - Files accepted: {len(filtered)}")
+    logger.info(f"  - Files skipped (outside range): {skipped}")
+    logger.info(f"  - Files with parsing errors: {error_count}")
+    logger.info("*" * 40)
+    
+    # Additional sanity check
+    if not filtered and (skipped > 0 or error_count > 0):
+        logger.warning("!!! NO FILES REMAIN AFTER DATE FILTERING !!! Check your date format and range.")
+    
     return filtered
 
 
@@ -192,12 +280,22 @@ def process_rhd_file(args: Tuple[Path, List[str]]) -> Tuple[Optional[si.BaseReco
 
 
 def reorder_channels(rec: si.BaseRecording, channel_order: List[int]) -> si.BaseRecording:
+    """Reorder channels in the recording based on specified index order."""
     all_ids = rec.get_channel_ids()
     n = rec.get_num_channels()
+    
     if any(idx < 0 or idx >= n for idx in channel_order):
         raise ValueError(f"Channel indices must be between 0 and {n-1}")
-    ids = [all_ids[i] for i in channel_order]
-    return rec.channel_slice(ids)
+    
+    # Log the original channel ordering
+    logger.info(f"Original channel ordering: {all_ids}")
+    
+    selected_ids = [all_ids[i] for i in channel_order]
+    
+    # Log the new channel ordering
+    logger.info(f"New channel ordering: {selected_ids}")
+    
+    return rec.channel_slice(selected_ids)
 
 
 def preprocess_recording(rec: si.BaseRecording) -> si.BaseRecording:
@@ -221,6 +319,40 @@ def create_processing_metadata(
             "channel_order": channel_order or []
         }
     }
+
+
+def get_optimal_chunk_memory(n_jobs=1):
+    """
+    Calculate optimal chunk_memory based on available free system memory and number of jobs.
+    
+    Args:
+        n_jobs: Number of parallel jobs that will be used
+        
+    Returns:
+        str: Memory size string (e.g., "500M", "2G")
+    """
+    # Get free system memory in MB
+    free_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
+    logger.info(f"Detected {free_memory_mb:.1f} MB of free memory")
+    
+    # Calculate available memory per job (with safety margin)
+    memory_per_job = free_memory_mb / (n_jobs * 1.5)  # 1.5 factor as safety margin
+    
+    # Calculate chunk size (30% of memory per job)
+    chunk_size_mb = int(memory_per_job * 0.1)
+    
+    # Ensure chunk size is within reasonable bounds
+    chunk_size_mb = max(100, min(chunk_size_mb, 8192))
+    
+    # Convert to appropriate units (M or G)
+    if chunk_size_mb >= 1024:
+        chunk_size_gb = chunk_size_mb / 1024
+        result = f"{int(chunk_size_gb)}G"
+    else:
+        result = f"{int(chunk_size_mb)}M"
+        
+    logger.info(f"Using {result} chunk size per job (with {n_jobs} jobs)")
+    return result
 
 
 def gather_parameters() -> Dict[str, Any]:
@@ -286,10 +418,35 @@ def gather_parameters() -> Dict[str, Any]:
             parser.error("Could not infer --datetime-format; specify it or run interactively")
 
     def get_optional_datetime(arg_str: Optional[str], question: str) -> Optional[datetime]:
+        """Get a datetime from arguments or prompt the user."""
         if arg_str:
-            return parse_datetime(arg_str)
+            try:
+                dt = parse_datetime(arg_str)
+                logger.info(f"Using datetime from command line: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                return dt
+            except ValueError as e:
+                logger.error(f"Invalid datetime format: {e}")
+                if interactive:
+                    logger.info("Prompting for datetime instead...")
+                else:
+                    raise
+        
         if interactive and yes_no(question):
-            return parse_datetime(input("Enter datetime: "))
+            while True:
+                try:
+                    dt_str = input("Enter datetime (e.g. 2025-03-01 or 250301_120000): ")
+                    dt = parse_datetime(dt_str)
+                    logger.info(f"Using datetime: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    return dt
+                except ValueError as e:
+                    logger.error(f"Invalid datetime: {e}")
+                    logger.info("Please try again with a valid format, examples:")
+                    logger.info("  - 2025-03-01 (year-month-day)")
+                    logger.info("  - 250301_120000 (YearMonthDay_HourMinuteSecond)")
+                    logger.info("  - 03/01/2025 (month/day/year)")
+                    if not yes_no("Try again?"):
+                        logger.info("Skipping datetime filter")
+                        return None
         return None
 
     min_dt = get_optional_datetime(args.min_datetime, "Filter by minimum datetime?")
@@ -312,7 +469,6 @@ def gather_parameters() -> Dict[str, Any]:
         "max_dt": max_dt,
         "channel_order": ch_order,
         "force": args.force,
-        "interactive": interactive,
     }
 
 
@@ -326,15 +482,14 @@ def main(
     max_dt: Optional[datetime],
     channel_order: Optional[List[int]],
     force: bool,
-    interactive: bool,
 ) -> None:
     files = load_rhd_files(input_folder, recursive)
     files = filter_files_by_datetime(files, datetime_formats, min_dt, max_dt)
     if not files:
         raise RuntimeError("No .rhd files to process after filtering.")
 
-    # only prompt for deletion if interactive
-    validate_output_folder(output_folder, force, interactive)
+    # Validate output folder
+    validate_output_folder(output_folder, force)
 
     tasks = [(f, datetime_formats) for f in files]
     results: List[Tuple[Optional[si.BaseRecording], Dict[str, Any]]] = []
@@ -351,6 +506,14 @@ def main(
     # Sort & accumulate
     results.sort(key=lambda rm: rm[1]["datetime"])
     recs, metas = zip(*results)
+    
+    # Display the datetime span of the recordings
+    start_datetime = datetime.fromisoformat(metas[0]["datetime"])
+    end_datetime = datetime.fromisoformat(metas[-1]["datetime"])
+    end_datetime += timedelta(seconds=recs[-1].get_num_frames() / recs[-1].get_sampling_frequency())
+    logger.info(f"Recording spans from {start_datetime} to {end_datetime}")
+    logger.info(f"Total duration: {(end_datetime - start_datetime).total_seconds() / 3600:.2f} hours")
+    
     cum = 0
     updated = []
     for r, m in zip(recs, metas):
@@ -361,12 +524,22 @@ def main(
         updated.append(m)
 
     final_rec = si.concatenate_recordings(list(recs)) if len(recs) > 1 else recs[0]
+    
+    # Log channel info before reordering
+    logger.info(f"Channel count: {final_rec.get_num_channels()}")
+    logger.info(f"Available channels: {final_rec.get_channel_ids()}")
+    
     if channel_order:
         final_rec = reorder_channels(final_rec, channel_order)
+    
     processed = preprocess_recording(final_rec)
 
+    # Calculate optimal chunk size based on available memory
+    chunk_memory = get_optimal_chunk_memory(n_jobs)
+    logger.info(f"Using chunk_memory={chunk_memory} for saving")
+
     logger.info(f"Saving processed recording to {output_folder}")
-    processed.save(dtype="int16", format="binary", folder=str(output_folder), n_jobs=n_jobs)
+    processed.save(dtype="int16", format="binary", folder=str(output_folder), n_jobs=n_jobs, chunk_memory=chunk_memory)
 
     all_meta = {
         "files": updated,
@@ -375,6 +548,14 @@ def main(
     with open(output_folder / "recording_metadata.json", 'w') as mf:
         json.dump(all_meta, mf, indent=4)
     logger.info(f"Metadata written to {output_folder / 'recording_metadata.json'}")
+    
+    # Display summary of the recording spans in the metadata
+    first_file = updated[0]["file_name"]
+    last_file = updated[-1]["file_name"]
+    first_datetime = datetime.fromisoformat(updated[0]["datetime"])
+    last_datetime = datetime.fromisoformat(updated[-1]["datetime"])
+    logger.info(f"Metadata includes files from {first_file} to {last_file}")
+    logger.info(f"Metadata datetime span: {first_datetime} to {last_datetime}")
 
 
 if __name__ == "__main__":
@@ -386,4 +567,7 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+        if logger.level == logging.DEBUG:
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
