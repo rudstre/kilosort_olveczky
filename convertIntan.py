@@ -287,13 +287,28 @@ def reorder_channels(rec: si.BaseRecording, channel_order: List[int]) -> si.Base
     if any(idx < 0 or idx >= n for idx in channel_order):
         raise ValueError(f"Channel indices must be between 0 and {n-1}")
     
-    # Log the original channel ordering
-    logger.info(f"Original channel ordering: {all_ids}")
+    # Group channels into tetrodes (groups of 4) for better readability
+    def format_as_tetrodes(channels):
+        tetrodes = []
+        for i in range(0, len(channels), 4):
+            group = channels[i:i+4]
+            if len(group) == 4:  # Only show complete tetrodes
+                tetrode_num = i // 4 + 1
+                tetrodes.append(f"Tetrode {tetrode_num}: {group}")
+        return tetrodes
     
+    # Log the original channel ordering as tetrodes
+    logger.info("Original channel ordering by tetrodes:")
+    for tetrode in format_as_tetrodes(all_ids):
+        logger.info(tetrode)
+    
+    # Get the reordered channels
     selected_ids = [all_ids[i] for i in channel_order]
     
-    # Log the new channel ordering
-    logger.info(f"New channel ordering: {selected_ids}")
+    # Log the new channel ordering as tetrodes
+    logger.info("New channel ordering by tetrodes:")
+    for tetrode in format_as_tetrodes(selected_ids):
+        logger.info(tetrode)
     
     return rec.channel_slice(selected_ids)
 
@@ -491,8 +506,24 @@ def main(
     final_rec = si.concatenate_recordings(list(recs)) if len(recs) > 1 else recs[0]
     
     # Log channel info before reordering
-    logger.info(f"Channel count: {final_rec.get_num_channels()}")
-    logger.info(f"Available channels: {final_rec.get_channel_ids()}")
+    logger.info(f"Total channel count: {final_rec.get_num_channels()}")
+    
+    # Only display channel organization when not reordering
+    # If reordering, the reorder_channels function will show before/after
+    if channel_order is None:
+        # Helper function to display channels as tetrodes
+        def display_channels_as_tetrodes(channels):
+            logger.info("Channels grouped by tetrodes:")
+            for i in range(0, len(channels), 4):
+                group = channels[i:i+4]
+                if len(group) == 4:  # Only show complete tetrodes
+                    tetrode_num = i // 4 + 1
+                    logger.info(f"  Tetrode {tetrode_num}: {group}")
+        
+        # Show available channels as tetrodes (only if not reordering)
+        display_channels_as_tetrodes(final_rec.get_channel_ids())
+    else:
+        logger.info("Channel reordering will be applied...")
     
     if channel_order:
         final_rec = reorder_channels(final_rec, channel_order)
