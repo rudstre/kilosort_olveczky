@@ -1,7 +1,17 @@
+#!/usr/bin/env python3
+"""
+createClusterPDF.py - Generate PDF reports of cluster waveforms with a summary page
+
+This script creates a PDF with:
+1. A summary page showing the number of clusters per tetrode
+2. Individual pages for each cluster showing waveforms, amplitudes, and ISI distributions
+"""
+
 import warnings
 import shlex
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
@@ -10,11 +20,12 @@ import scipy.stats as stats
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.backends.backend_pdf import PdfPages
 
 from kilosort.data_tools import get_cluster_spikes
 from sampleToDateTime import sample_to_datetime
 
-# Suppress matplotlib warnings from external libraries
+# Suppress matplotlib warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 # Scaling factor: convert kilosort units to microvolts
@@ -247,23 +258,91 @@ def create_cluster_figure(data: Dict[str, Any]) -> plt.Figure:
             isi_ax.text(
                 0.05, 0.95,
                 f"Refractory violations: {data['violations']} ({data['vio_pct']:.2f}%)",
-                transform=isi_ax.transAxes, va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
+                transform=isi_ax.transAxes, va='top', 
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
             )
         isi_ax.set_xlabel('ISI (log10(ms))')
         isi_ax.set_ylabel('Density')
     else:
-        isi_ax.text(0.5, 0.5, 'Not enough spikes to calculate ISI', ha='center', va='center')
+        isi_ax.text(0.5, 0.5, 'Not enough spikes to calculate ISI', 
+                   transform=isi_ax.transAxes, ha='center', va='center')
     isi_ax.set_title('Inter-Spike Interval Distribution', pad=12)
 
     fig.suptitle(f"Tetrode {data['tetrode']} Waveforms for Cluster {data['cluster_id']}", fontsize=16)
     return fig
 
 
+def create_summary_page(cluster_data_list, min_amplitude):
+    """Create a summary page showing clusters per tetrode"""
+    # Use the same figure size as cluster figures for consistency
+    fig = plt.figure(figsize=(14, 12), constrained_layout=True)
+    
+    # Count clusters per tetrode
+    tetrode_counts = Counter([data['tetrode'] for data in cluster_data_list])
+    
+    # Find all possible tetrode numbers from the data
+    all_tetrodes = set([data['tetrode'] for data in cluster_data_list])
+    
+    # Create a range from min to max tetrode numbers to ensure all are shown
+    if all_tetrodes:
+        min_tetrode = min(all_tetrodes)
+        max_tetrode = max(all_tetrodes)
+        # Show at least tetrodes 1-16 or extend to max if higher
+        max_tetrode = max(16, max_tetrode)
+        tetrodes = list(range(min_tetrode, max_tetrode + 1))
+    else:
+        # Default range if no tetrodes found
+        tetrodes = list(range(1, 17))
+    
+    # Get counts for all tetrodes (0 for those without clusters)
+    counts = [tetrode_counts.get(t, 0) for t in tetrodes]
+    
+    # Create the bar chart
+    ax = fig.add_subplot(111)
+    bars = ax.bar(tetrodes, counts, color='steelblue', alpha=0.7)
+    
+    # Add count labels on top of bars for non-zero counts
+    for bar, count in zip(bars, counts):
+        if count > 0:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                    f'{count}', ha='center', va='bottom', fontsize=12)
+    
+    # Set labels and title
+    ax.set_xlabel('Tetrode Number', fontsize=14)
+    ax.set_ylabel('Number of Clusters', fontsize=14)
+    ax.set_xticks(tetrodes)
+    ax.set_title('Cluster Distribution by Tetrode', fontsize=16, pad=20)
+    
+    # Ensure y-axis has enough room for labels
+    if max(counts) > 0:
+        ax.set_ylim(0, max(counts) * 1.15)  # Add 15% padding on top
+    
+    # Add a text box with summary info - moved to top right
+    textstr = '\n'.join((
+        f'Total Clusters: {len(cluster_data_list)}',
+        f'Total Tetrodes with Units: {len(tetrode_counts)}',
+        f'Min Amplitude Threshold: {min_amplitude} µV',
+        f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}'
+    ))
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax.text(0.95, 0.95, textstr, transform=ax.transAxes, fontsize=12,
+            verticalalignment='top', horizontalalignment='right', bbox=props)
+    
+    # Some styling for the figure
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    return fig
+
+
 if __name__ == "__main__":
     import logging
-    from matplotlib.backends.backend_pdf import PdfPages
     import pandas as pd
     from tqdm import tqdm
+    from kilosort.io import load_ops
+    from sampleToDateTime import load_metadata
 
     # Use non-interactive backend for PDF output
     plt.switch_backend('Agg')
@@ -273,8 +352,8 @@ if __name__ == "__main__":
     @click.option('--results-dir', '-d', type=click.Path(exists=True), help='Path to Kilosort results')
     @click.option('--min-amplitude', '-a', type=float, default=None, help='Minimum amplitude threshold (µV)')
     @click.option('--quiet', '-q', is_flag=True, help='Suppress progress messages')
-    def main(results_dir, min_amplitude, quiet):  # pylint: disable=unused-argument
-        """Generate waveform plots with optional amplitude filtering"""
+    def main(results_dir, min_amplitude, quiet):
+        """Generate waveform plots with summary page and optional amplitude filtering"""
         # --- Interactive prompts for missing arguments ---
         if results_dir is None:
             while True:
@@ -295,8 +374,6 @@ if __name__ == "__main__":
 
         # --- Load metadata and cluster info ---
         try:
-            from kilosort.io import load_ops
-            from sampleToDateTime import load_metadata
             ops = load_ops(Path(results_dir) / 'ops.npy')
             metadata = load_metadata(results_dir, ops)
             cluster_info = pd.read_csv(results_dir / 'cluster_group.tsv', sep='\t')
@@ -311,64 +388,53 @@ if __name__ == "__main__":
             shanks = np.load(results_dir / 'channel_shanks.npy')
             tet_assign = {}
             for cid in cluster_ids:
-                amps = np.max(np.abs(templates[cid]), axis=0)
-                best = int(np.argmax(amps))
-                tet_assign[cid] = int(shanks[best])
+                try:
+                    amps = np.max(np.abs(templates[cid]), axis=0)
+                    best = int(np.argmax(amps))
+                    tet_assign[cid] = int(shanks[best])
+                except:
+                    tet_assign[cid] = 999
         except Exception:
             tet_assign = {cid: 0 for cid in cluster_ids}
 
-        sorted_ids = sorted(cluster_ids, key=lambda c: (tet_assign.get(c, 0), c))
+        sorted_ids = sorted(cluster_ids, key=lambda c: (tet_assign.get(c, 999), c))
 
         suffix = f"_min{min_amplitude}uV" if min_amplitude and min_amplitude > 0 else ''
         pdf_file = Path(results_dir) / f"cluster_waveforms{suffix}.pdf"
         click.echo(f"Saving to {pdf_file}")
 
-        # PDF optimization settings
-        pdf_options = {
-            'metadata': {
-                'Title': f'Kilosort Cluster Waveforms (min amp: {min_amplitude}μV)',
-                'Creator': 'plotSingleWaveformWithAmplitude.py',
-            }
-        }
-
-        included = 0
-        with PdfPages(pdf_file, **pdf_options) as pdf:
-            # First, collect all valid clusters to create bookmarks
-            bookmarks = []
-            all_data = []
+        # --- Process all clusters first to collect data ---
+        click.echo("Processing clusters...")
+        all_data = []
+        for cid in tqdm(sorted_ids, disable=quiet):
+            try:
+                data = prepare_cluster_data(cid, metadata, min_amplitude)
+                if data is not None:
+                    all_data.append(data)
+            except Exception as e:
+                click.echo(f"Error processing cluster {cid}: {e}")
+        
+        click.echo(f"Creating PDF with {len(all_data)} clusters...")
+        
+        # --- Generate PDF with summary page first ---
+        with PdfPages(pdf_file) as pdf:
+            # Add summary page as the first page
+            summary_fig = create_summary_page(all_data, min_amplitude)
+            pdf.savefig(summary_fig)
+            plt.close(summary_fig)
             
-            click.echo("Preparing cluster data...")
-            for cid in tqdm(sorted_ids, disable=quiet, desc="Analyzing clusters"):
-                # Get the data for this cluster
-                cluster_data = prepare_cluster_data(cid, metadata, min_amplitude)
-                # Only proceed if we have valid data
-                if cluster_data is not None:
-                    all_data.append(cluster_data)
-                    # Create bookmark entry: Tetrode X - Cluster Y
-                    bookmarks.append(f"Tetrode {cluster_data['tetrode']} - Cluster {cid}")
-            
-            # Now generate figures and save to PDF
-            click.echo(f"Generating PDF with {len(all_data)} clusters...")
-            for i, (bookmark, cluster_data) in enumerate(zip(bookmarks, all_data), 1):
-                fig = create_cluster_figure(cluster_data)
-                
-                # Use simplified suptitle to reduce complexity
-                plt.suptitle(bookmark, fontsize=16)
-                
-                # Add the figure to PDF with bookmark
-                pdf.savefig(fig, dpi=100, bbox_inches='tight')
-                
-                # Add PDF outline/bookmark
-                pdf._fig_names.append(bookmark)
-                
-                plt.close(fig)
-                
-                # Update progress
-                if i % 10 == 0 or i == len(all_data):
-                    click.echo(f"Progress: {i}/{len(all_data)} clusters")
-            
-            included = len(all_data)
-            
-        click.echo(f"Done: {included}/{len(sorted_ids)} clusters included")
+            # Add individual cluster pages
+            for i, data in enumerate(tqdm(all_data, disable=quiet), 1):
+                try:
+                    fig = create_cluster_figure(data)
+                    pdf.savefig(fig, dpi=100, bbox_inches='tight')
+                    plt.close(fig)
+                    
+                    if i % 10 == 0:
+                        click.echo(f"Progress: {i}/{len(all_data)}")
+                except Exception as e:
+                    click.echo(f"Error creating figure for cluster {data['cluster_id']}: {e}")
+                    
+        click.echo(f"Done: {len(all_data)}/{len(sorted_ids)} clusters included in PDF")
 
     main()
