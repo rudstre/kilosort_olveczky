@@ -1,4 +1,5 @@
+osqp
 spikeinterface[full]
 seaborn
--e .
+click
 

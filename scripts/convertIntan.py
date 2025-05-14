@@ -279,7 +279,7 @@ def process_rhd_file(args: Tuple[Path, List[str]]) -> Tuple[Optional[si.BaseReco
         return None, {"file_name": file_path.name, "error": str(e)}
 
 
-def reorder_channels(rec: si.BaseRecording, channel_order: List[int]) -> si.BaseRecording:
+def reorder_channels(rec: si.BaseRecording, channel_order: List[int]) -> Tuple[si.BaseRecording, List[str]]:
     """Reorder channels in the recording based on specified index order."""
     all_ids = rec.get_channel_ids()
     n = rec.get_num_channels()
@@ -310,7 +310,7 @@ def reorder_channels(rec: si.BaseRecording, channel_order: List[int]) -> si.Base
     for tetrode in format_as_tetrodes(selected_ids):
         logger.info(tetrode)
     
-    return rec.channel_slice(selected_ids)
+    return rec.channel_slice(selected_ids), selected_ids
 
 
 def preprocess_recording(rec: si.BaseRecording) -> si.BaseRecording:
@@ -323,6 +323,7 @@ def create_processing_metadata(
     min_dt: Optional[datetime],
     max_dt: Optional[datetime],
     channel_order: Optional[List[int]],
+    channel_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     return {
         "datetime_range": {
@@ -331,7 +332,8 @@ def create_processing_metadata(
         },
         "processing_info": {
             "channel_order_used": bool(channel_order),
-            "channel_order": channel_order or []
+            "channel_order": channel_order or [],
+            "channel_names": channel_names or []
         }
     }
 
@@ -525,8 +527,11 @@ def main(
     else:
         logger.info("Channel reordering will be applied...")
     
+    # Initialize channel_names to None
+    channel_names = None
+    
     if channel_order:
-        final_rec = reorder_channels(final_rec, channel_order)
+        final_rec, channel_names = reorder_channels(final_rec, channel_order)
     
     processed = preprocess_recording(final_rec)
 
@@ -535,7 +540,7 @@ def main(
 
     all_meta = {
         "files": updated,
-        "run_info": create_processing_metadata(min_dt, max_dt, channel_order),
+        "run_info": create_processing_metadata(min_dt, max_dt, channel_order, channel_names),
     }
     with open(output_folder / "recording_metadata.json", 'w') as mf:
         json.dump(all_meta, mf, indent=4)

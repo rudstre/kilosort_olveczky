@@ -11,4 +11,3 @@ requests
 responses
 traitlets
 git+https://github.com/cortex-lab/phy.git
--e .[gui]
